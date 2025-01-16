@@ -193,7 +193,8 @@ def clean_str(input: Any) -> str:
     # If we get non-string input, just give it back
     if not isinstance(input, str):
         return input
-
+    # Xander Yuan: strip whitespaces in ""
+    input = input.removeprefix('"').removesuffix('"')
     result = html.unescape(input.strip())
     # https://stackoverflow.com/questions/4324790/removing-control-characters-from-a-string-in-python
     return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", result)
