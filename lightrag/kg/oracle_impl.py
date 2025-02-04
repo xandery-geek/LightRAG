@@ -1,3 +1,4 @@
+import os
 import asyncio
 
 # import html
@@ -6,6 +7,11 @@ from dataclasses import dataclass
 from typing import Union
 import numpy as np
 import array
+import pipmaster as pm
+
+if not pm.is_installed("oracledb"):
+    pm.install("oracledb")
+
 
 from ..utils import logger
 from ..base import (
@@ -336,10 +342,14 @@ class OracleKVStorage(BaseKVStorage):
 class OracleVectorDBStorage(BaseVectorStorage):
     # should pass db object to self.db
     db: OracleDB = None
-    cosine_better_than_threshold: float = 0.2
+    cosine_better_than_threshold: float = float(os.getenv("COSINE_THRESHOLD", "0.2"))
 
     def __post_init__(self):
-        pass
+        # Use global config value if specified, otherwise use default
+        config = self.global_config.get("vector_db_storage_cls_kwargs", {})
+        self.cosine_better_than_threshold = config.get(
+            "cosine_better_than_threshold", self.cosine_better_than_threshold
+        )
 
     async def upsert(self, data: dict[str, dict]):
         """向向量数据库中插入数据"""
@@ -769,7 +779,7 @@ SQL_TEMPLATES = {
         COLUMNS (e.source_name,e.target_name)  )""",
     "node_degree": """SELECT count(1) as degree FROM GRAPH_TABLE (lightrag_graph
         MATCH (a)-[e]->(b)
-        WHERE a.workspace=:workspace and a.workspace=:workspace and b.workspace=:workspace
+        WHERE e.workspace=:workspace and a.workspace=:workspace and b.workspace=:workspace
         AND a.name=:node_id or b.name = :node_id
         COLUMNS (a.name))""",
     "get_node": """SELECT t1.name,t2.entity_type,t2.source_chunk_id as source_id,NVL(t2.description,'') AS description
