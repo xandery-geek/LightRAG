@@ -66,6 +66,8 @@ from lightrag.exceptions import (
     RateLimitError,
     APITimeoutError,
 )
+from lightrag.api import __api_version__
+from lightrag.utils import extract_reasoning
 import numpy as np
 from typing import Union
 
@@ -85,17 +87,19 @@ async def ollama_model_if_cache(
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
     stream = True if kwargs.get("stream") else False
+    reasoning_tag = kwargs.pop("reasoning_tag", None)
     kwargs.pop("max_tokens", None)
     # kwargs.pop("response_format", None) # allow json
     host = kwargs.pop("host", None)
     timeout = kwargs.pop("timeout", None)
     kwargs.pop("hashing_kv", None)
     api_key = kwargs.pop("api_key", None)
-    headers = (
-        {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-        if api_key
-        else {"Content-Type": "application/json"}
-    )
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": f"LightRAG/{__api_version__}",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     ollama_client = ollama.AsyncClient(host=host, timeout=timeout, headers=headers)
     messages = []
     if system_prompt:
@@ -105,7 +109,7 @@ async def ollama_model_if_cache(
 
     response = await ollama_client.chat(model=model, messages=messages, **kwargs)
     if stream:
-        """cannot cache stream response"""
+        """cannot cache stream response and process reasoning"""
 
         async def inner():
             async for chunk in response:
@@ -113,7 +117,19 @@ async def ollama_model_if_cache(
 
         return inner()
     else:
-        return response["message"]["content"]
+        model_response = response["message"]["content"]
+
+        """
+        If the model also wraps its thoughts in a specific tag,
+        this information is not needed for the final
+        response and can simply be trimmed.
+        """
+
+        return (
+            model_response
+            if reasoning_tag is None
+            else extract_reasoning(model_response, reasoning_tag).response_content
+        )
 
 
 async def ollama_model_complete(
@@ -147,11 +163,12 @@ async def ollama_embedding(texts: list[str], embed_model, **kwargs) -> np.ndarra
 
 async def ollama_embed(texts: list[str], embed_model, **kwargs) -> np.ndarray:
     api_key = kwargs.pop("api_key", None)
-    headers = (
-        {"Content-Type": "application/json", "Authorization": api_key}
-        if api_key
-        else {"Content-Type": "application/json"}
-    )
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": f"LightRAG/{__api_version__}",
+    }
+    if api_key:
+        headers["Authorization"] = api_key
     kwargs["headers"] = headers
     ollama_client = ollama.Client(**kwargs)
     data = ollama_client.embed(model=embed_model, input=texts)
