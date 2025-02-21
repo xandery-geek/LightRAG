@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   lightrag:
     build: .
@@ -8,6 +6,7 @@ services:
     volumes:
       - ./data/rag_storage:/app/data/rag_storage
       - ./data/inputs:/app/data/inputs
+      - .env:/app/.env
     env_file:
       - .env
     environment:

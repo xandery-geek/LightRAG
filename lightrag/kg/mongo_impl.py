@@ -1,8 +1,23 @@
 import os
-from tqdm.asyncio import tqdm as tqdm_async
-from dataclasses import dataclass
-import pipmaster as pm
+from dataclasses import dataclass, field
 import numpy as np
+import configparser
+import asyncio
+
+from typing import Any, List, Union, final
+
+from ..base import (
+    BaseGraphStorage,
+    BaseKVStorage,
+    BaseVectorStorage,
+    DocProcessingStatus,
+    DocStatus,
+    DocStatusStorage,
+)
+from ..namespace import NameSpace, is_namespace
+from ..utils import logger
+from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
+import pipmaster as pm
 
 if not pm.is_installed("pymongo"):
     pm.install("pymongo")
@@ -10,68 +25,118 @@ if not pm.is_installed("pymongo"):
 if not pm.is_installed("motor"):
     pm.install("motor")
 
-from pymongo import MongoClient
-from motor.motor_asyncio import AsyncIOMotorClient
-from typing import Union, List, Tuple
+from motor.motor_asyncio import (
+    AsyncIOMotorClient,
+    AsyncIOMotorDatabase,
+    AsyncIOMotorCollection,
+)
+from pymongo.operations import SearchIndexModel
+from pymongo.errors import PyMongoError
 
-from ..utils import logger
-from ..base import BaseKVStorage, BaseGraphStorage
-from ..namespace import NameSpace, is_namespace
+config = configparser.ConfigParser()
+config.read("config.ini", "utf-8")
 
 
+class ClientManager:
+    _instances = {"db": None, "ref_count": 0}
+    _lock = asyncio.Lock()
+
+    @classmethod
+    async def get_client(cls) -> AsyncIOMotorDatabase:
+        async with cls._lock:
+            if cls._instances["db"] is None:
+                uri = os.environ.get(
+                    "MONGO_URI",
+                    config.get(
+                        "mongodb",
+                        "uri",
+                        fallback="mongodb://root:root@localhost:27017/",
+                    ),
+                )
+                database_name = os.environ.get(
+                    "MONGO_DATABASE",
+                    config.get("mongodb", "database", fallback="LightRAG"),
+                )
+                client = AsyncIOMotorClient(uri)
+                db = client.get_database(database_name)
+                cls._instances["db"] = db
+                cls._instances["ref_count"] = 0
+            cls._instances["ref_count"] += 1
+            return cls._instances["db"]
+
+    @classmethod
+    async def release_client(cls, db: AsyncIOMotorDatabase):
+        async with cls._lock:
+            if db is not None:
+                if db is cls._instances["db"]:
+                    cls._instances["ref_count"] -= 1
+                    if cls._instances["ref_count"] == 0:
+                        cls._instances["db"] = None
+
+
+@final
 @dataclass
 class MongoKVStorage(BaseKVStorage):
+    db: AsyncIOMotorDatabase = field(default=None)
+    _data: AsyncIOMotorCollection = field(default=None)
+
     def __post_init__(self):
-        client = MongoClient(
-            os.environ.get("MONGO_URI", "mongodb://root:root@localhost:27017/")
-        )
-        database = client.get_database(os.environ.get("MONGO_DATABASE", "LightRAG"))
-        self._data = database.get_collection(self.namespace)
-        logger.info(f"Use MongoDB as KV {self.namespace}")
+        self._collection_name = self.namespace
 
-    async def all_keys(self) -> list[str]:
-        return [x["_id"] for x in self._data.find({}, {"_id": 1})]
+    async def initialize(self):
+        if self.db is None:
+            self.db = await ClientManager.get_client()
+            self._data = await get_or_create_collection(self.db, self._collection_name)
+            logger.debug(f"Use MongoDB as KV {self._collection_name}")
 
-    async def get_by_id(self, id):
-        return self._data.find_one({"_id": id})
+    async def finalize(self):
+        if self.db is not None:
+            await ClientManager.release_client(self.db)
+            self.db = None
+            self._data = None
 
-    async def get_by_ids(self, ids, fields=None):
-        if fields is None:
-            return list(self._data.find({"_id": {"$in": ids}}))
-        return list(
-            self._data.find(
-                {"_id": {"$in": ids}},
-                {field: 1 for field in fields},
-            )
-        )
+    async def get_by_id(self, id: str) -> dict[str, Any] | None:
+        return await self._data.find_one({"_id": id})
 
-    async def filter_keys(self, data: list[str]) -> set[str]:
-        existing_ids = [
-            str(x["_id"]) for x in self._data.find({"_id": {"$in": data}}, {"_id": 1})
-        ]
-        return set([s for s in data if s not in existing_ids])
+    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+        cursor = self._data.find({"_id": {"$in": ids}})
+        return await cursor.to_list()
 
-    async def upsert(self, data: dict[str, dict]):
+    async def filter_keys(self, keys: set[str]) -> set[str]:
+        cursor = self._data.find({"_id": {"$in": list(keys)}}, {"_id": 1})
+        existing_ids = {str(x["_id"]) async for x in cursor}
+        return keys - existing_ids
+
+    async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        logger.info(f"Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
+
         if is_namespace(self.namespace, NameSpace.KV_STORE_LLM_RESPONSE_CACHE):
+            update_tasks: list[Any] = []
             for mode, items in data.items():
-                for k, v in tqdm_async(items.items(), desc="Upserting"):
+                for k, v in items.items():
                     key = f"{mode}_{k}"
-                    result = self._data.update_one(
-                        {"_id": key}, {"$setOnInsert": v}, upsert=True
+                    data[mode][k]["_id"] = f"{mode}_{k}"
+                    update_tasks.append(
+                        self._data.update_one(
+                            {"_id": key}, {"$setOnInsert": v}, upsert=True
+                        )
                     )
-                    if result.upserted_id:
-                        logger.debug(f"\nInserted new document with key: {key}")
-                    data[mode][k]["_id"] = key
+            await asyncio.gather(*update_tasks)
         else:
-            for k, v in tqdm_async(data.items(), desc="Upserting"):
-                self._data.update_one({"_id": k}, {"$set": v}, upsert=True)
+            update_tasks = []
+            for k, v in data.items():
                 data[k]["_id"] = k
-        return data
+                update_tasks.append(
+                    self._data.update_one({"_id": k}, {"$set": v}, upsert=True)
+                )
+            await asyncio.gather(*update_tasks)
 
     async def get_by_mode_and_id(self, mode: str, id: str) -> Union[dict, None]:
         if is_namespace(self.namespace, NameSpace.KV_STORE_LLM_RESPONSE_CACHE):
             res = {}
-            v = self._data.find_one({"_id": mode + "_" + id})
+            v = await self._data.find_one({"_id": mode + "_" + id})
             if v:
                 res[id] = v
                 logger.debug(f"llm_response_cache find one by:{id}")
@@ -81,16 +146,99 @@ class MongoKVStorage(BaseKVStorage):
         else:
             return None
 
-    async def drop(self):
-        """ """
+    async def index_done_callback(self) -> None:
+        # Mongo handles persistence automatically
         pass
 
 
+@final
+@dataclass
+class MongoDocStatusStorage(DocStatusStorage):
+    db: AsyncIOMotorDatabase = field(default=None)
+    _data: AsyncIOMotorCollection = field(default=None)
+
+    def __post_init__(self):
+        self._collection_name = self.namespace
+
+    async def initialize(self):
+        if self.db is None:
+            self.db = await ClientManager.get_client()
+            self._data = await get_or_create_collection(self.db, self._collection_name)
+            logger.debug(f"Use MongoDB as DocStatus {self._collection_name}")
+
+    async def finalize(self):
+        if self.db is not None:
+            await ClientManager.release_client(self.db)
+            self.db = None
+            self._data = None
+
+    async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
+        return await self._data.find_one({"_id": id})
+
+    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+        cursor = self._data.find({"_id": {"$in": ids}})
+        return await cursor.to_list()
+
+    async def filter_keys(self, data: set[str]) -> set[str]:
+        cursor = self._data.find({"_id": {"$in": list(data)}}, {"_id": 1})
+        existing_ids = {str(x["_id"]) async for x in cursor}
+        return data - existing_ids
+
+    async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        logger.info(f"Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
+        update_tasks: list[Any] = []
+        for k, v in data.items():
+            data[k]["_id"] = k
+            update_tasks.append(
+                self._data.update_one({"_id": k}, {"$set": v}, upsert=True)
+            )
+        await asyncio.gather(*update_tasks)
+
+    async def get_status_counts(self) -> dict[str, int]:
+        """Get counts of documents in each status"""
+        pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+        cursor = self._data.aggregate(pipeline)
+        result = await cursor.to_list()
+        counts = {}
+        for doc in result:
+            counts[doc["_id"]] = doc["count"]
+        return counts
+
+    async def get_docs_by_status(
+        self, status: DocStatus
+    ) -> dict[str, DocProcessingStatus]:
+        """Get all documents with a specific status"""
+        cursor = self._data.find({"status": status.value})
+        result = await cursor.to_list()
+        return {
+            doc["_id"]: DocProcessingStatus(
+                content=doc["content"],
+                content_summary=doc.get("content_summary"),
+                content_length=doc["content_length"],
+                status=doc["status"],
+                created_at=doc.get("created_at"),
+                updated_at=doc.get("updated_at"),
+                chunks_count=doc.get("chunks_count", -1),
+            )
+            for doc in result
+        }
+
+    async def index_done_callback(self) -> None:
+        # Mongo handles persistence automatically
+        pass
+
+
+@final
 @dataclass
 class MongoGraphStorage(BaseGraphStorage):
     """
-    A concrete implementation using MongoDB’s $graphLookup to demonstrate multi-hop queries.
+    A concrete implementation using MongoDB's $graphLookup to demonstrate multi-hop queries.
     """
+
+    db: AsyncIOMotorDatabase = field(default=None)
+    collection: AsyncIOMotorCollection = field(default=None)
 
     def __init__(self, namespace, global_config, embedding_func):
         super().__init__(
@@ -98,11 +246,21 @@ class MongoGraphStorage(BaseGraphStorage):
             global_config=global_config,
             embedding_func=embedding_func,
         )
-        self.client = AsyncIOMotorClient(
-            os.environ.get("MONGO_URI", "mongodb://root:root@localhost:27017/")
-        )
-        self.db = self.client[os.environ.get("MONGO_DATABASE", "LightRAG")]
-        self.collection = self.db[os.environ.get("MONGO_KG_COLLECTION", "MDB_KG")]
+        self._collection_name = self.namespace
+
+    async def initialize(self):
+        if self.db is None:
+            self.db = await ClientManager.get_client()
+            self.collection = await get_or_create_collection(
+                self.db, self._collection_name
+            )
+            logger.debug(f"Use MongoDB as KG {self._collection_name}")
+
+    async def finalize(self):
+        if self.db is not None:
+            await ClientManager.release_client(self.db)
+            self.db = None
+            self.collection = None
 
     #
     # -------------------------------------------------------------------------
@@ -181,7 +339,6 @@ class MongoGraphStorage(BaseGraphStorage):
         But typically for a direct edge, we might just do a find_one.
         Below is a demonstration approach.
         """
-
         # We can do a single-hop graphLookup (maxDepth=0 or 1).
         # Then check if the target_node appears among the edges array.
         pipeline = [
@@ -308,7 +465,7 @@ class MongoGraphStorage(BaseGraphStorage):
     # -------------------------------------------------------------------------
     #
 
-    async def get_node(self, node_id: str) -> Union[dict, None]:
+    async def get_node(self, node_id: str) -> dict[str, str] | None:
         """
         Return the full node document (including "edges"), or None if missing.
         """
@@ -316,11 +473,7 @@ class MongoGraphStorage(BaseGraphStorage):
 
     async def get_edge(
         self, source_node_id: str, target_node_id: str
-    ) -> Union[dict, None]:
-        """
-        Return the first edge dict from source_node_id to target_node_id if it exists.
-        Uses a single-hop $graphLookup as demonstration, though a direct find is simpler.
-        """
+    ) -> dict[str, str] | None:
         pipeline = [
             {"$match": {"_id": source_node_id}},
             {
@@ -346,11 +499,9 @@ class MongoGraphStorage(BaseGraphStorage):
                 return e
         return None
 
-    async def get_node_edges(
-        self, source_node_id: str
-    ) -> Union[List[Tuple[str, str]], None]:
+    async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
         """
-        Return a list of (target_id, relation) for direct edges from source_node_id.
+        Return a list of (source_id, target_id) for direct edges from source_node_id.
         Demonstrates $graphLookup at maxDepth=0, though direct doc retrieval is simpler.
         """
         pipeline = [
@@ -374,7 +525,7 @@ class MongoGraphStorage(BaseGraphStorage):
             return None
 
         edges = result[0].get("edges", [])
-        return [(e["target"], e["relation"]) for e in edges]
+        return [(source_node_id, e["target"]) for e in edges]
 
     #
     # -------------------------------------------------------------------------
@@ -382,7 +533,7 @@ class MongoGraphStorage(BaseGraphStorage):
     # -------------------------------------------------------------------------
     #
 
-    async def upsert_node(self, node_id: str, node_data: dict):
+    async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         """
         Insert or update a node document. If new, create an empty edges array.
         """
@@ -392,8 +543,8 @@ class MongoGraphStorage(BaseGraphStorage):
         await self.collection.update_one({"_id": node_id}, update_doc, upsert=True)
 
     async def upsert_edge(
-        self, source_node_id: str, target_node_id: str, edge_data: dict
-    ):
+        self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
+    ) -> None:
         """
         Upsert an edge from source_node_id -> target_node_id with optional 'relation'.
         If an edge with the same target exists, we remove it and re-insert with updated data.
@@ -419,9 +570,9 @@ class MongoGraphStorage(BaseGraphStorage):
     # -------------------------------------------------------------------------
     #
 
-    async def delete_node(self, node_id: str):
+    async def delete_node(self, node_id: str) -> None:
         """
-        1) Remove node’s doc entirely.
+        1) Remove node's doc entirely.
         2) Remove inbound edges from any doc that references node_id.
         """
         # Remove inbound edges from all other docs
@@ -436,8 +587,365 @@ class MongoGraphStorage(BaseGraphStorage):
     # -------------------------------------------------------------------------
     #
 
-    async def embed_nodes(self, algorithm: str) -> Tuple[np.ndarray, List[str]]:
+    async def embed_nodes(
+        self, algorithm: str
+    ) -> tuple[np.ndarray[Any, Any], list[str]]:
         """
         Placeholder for demonstration, raises NotImplementedError.
         """
         raise NotImplementedError("Node embedding is not used in lightrag.")
+
+    #
+    # -------------------------------------------------------------------------
+    # QUERY
+    # -------------------------------------------------------------------------
+    #
+
+    async def get_all_labels(self) -> list[str]:
+        """
+        Get all existing node _id in the database
+        Returns:
+            [id1, id2, ...]  # Alphabetically sorted id list
+        """
+        # Use MongoDB's distinct and aggregation to get all unique labels
+        pipeline = [
+            {"$group": {"_id": "$_id"}},  # Group by _id
+            {"$sort": {"_id": 1}},  # Sort alphabetically
+        ]
+
+        cursor = self.collection.aggregate(pipeline)
+        labels = []
+        async for doc in cursor:
+            labels.append(doc["_id"])
+        return labels
+
+    async def get_knowledge_graph(
+        self, node_label: str, max_depth: int = 5
+    ) -> KnowledgeGraph:
+        """
+        Get complete connected subgraph for specified node (including the starting node itself)
+
+        Args:
+            node_label: Label of the nodes to start from
+            max_depth: Maximum depth of traversal (default: 5)
+
+        Returns:
+            KnowledgeGraph object containing nodes and edges of the subgraph
+        """
+        label = node_label
+        result = KnowledgeGraph()
+        seen_nodes = set()
+        seen_edges = set()
+
+        try:
+            if label == "*":
+                # Get all nodes and edges
+                async for node_doc in self.collection.find({}):
+                    node_id = str(node_doc["_id"])
+                    if node_id not in seen_nodes:
+                        result.nodes.append(
+                            KnowledgeGraphNode(
+                                id=node_id,
+                                labels=[node_doc.get("_id")],
+                                properties={
+                                    k: v
+                                    for k, v in node_doc.items()
+                                    if k not in ["_id", "edges"]
+                                },
+                            )
+                        )
+                        seen_nodes.add(node_id)
+
+                        # Process edges
+                        for edge in node_doc.get("edges", []):
+                            edge_id = f"{node_id}-{edge['target']}"
+                            if edge_id not in seen_edges:
+                                result.edges.append(
+                                    KnowledgeGraphEdge(
+                                        id=edge_id,
+                                        type=edge.get("relation", ""),
+                                        source=node_id,
+                                        target=edge["target"],
+                                        properties={
+                                            k: v
+                                            for k, v in edge.items()
+                                            if k not in ["target", "relation"]
+                                        },
+                                    )
+                                )
+                                seen_edges.add(edge_id)
+            else:
+                # Verify if starting node exists
+                start_nodes = self.collection.find({"_id": label})
+                start_nodes_exist = await start_nodes.to_list(length=1)
+                if not start_nodes_exist:
+                    logger.warning(f"Starting node with label {label} does not exist!")
+                    return result
+
+                # Use $graphLookup for traversal
+                pipeline = [
+                    {
+                        "$match": {"_id": label}
+                    },  # Start with nodes having the specified label
+                    {
+                        "$graphLookup": {
+                            "from": self._collection_name,
+                            "startWith": "$edges.target",
+                            "connectFromField": "edges.target",
+                            "connectToField": "_id",
+                            "maxDepth": max_depth,
+                            "depthField": "depth",
+                            "as": "connected_nodes",
+                        }
+                    },
+                ]
+
+                async for doc in self.collection.aggregate(pipeline):
+                    # Add the start node
+                    node_id = str(doc["_id"])
+                    if node_id not in seen_nodes:
+                        result.nodes.append(
+                            KnowledgeGraphNode(
+                                id=node_id,
+                                labels=[
+                                    doc.get(
+                                        "_id",
+                                    )
+                                ],
+                                properties={
+                                    k: v
+                                    for k, v in doc.items()
+                                    if k
+                                    not in [
+                                        "_id",
+                                        "edges",
+                                        "connected_nodes",
+                                        "depth",
+                                    ]
+                                },
+                            )
+                        )
+                        seen_nodes.add(node_id)
+
+                    # Add edges from start node
+                    for edge in doc.get("edges", []):
+                        edge_id = f"{node_id}-{edge['target']}"
+                        if edge_id not in seen_edges:
+                            result.edges.append(
+                                KnowledgeGraphEdge(
+                                    id=edge_id,
+                                    type=edge.get("relation", ""),
+                                    source=node_id,
+                                    target=edge["target"],
+                                    properties={
+                                        k: v
+                                        for k, v in edge.items()
+                                        if k not in ["target", "relation"]
+                                    },
+                                )
+                            )
+                            seen_edges.add(edge_id)
+
+                    # Add connected nodes and their edges
+                    for connected in doc.get("connected_nodes", []):
+                        node_id = str(connected["_id"])
+                        if node_id not in seen_nodes:
+                            result.nodes.append(
+                                KnowledgeGraphNode(
+                                    id=node_id,
+                                    labels=[connected.get("_id")],
+                                    properties={
+                                        k: v
+                                        for k, v in connected.items()
+                                        if k not in ["_id", "edges", "depth"]
+                                    },
+                                )
+                            )
+                            seen_nodes.add(node_id)
+
+                            # Add edges from connected nodes
+                            for edge in connected.get("edges", []):
+                                edge_id = f"{node_id}-{edge['target']}"
+                                if edge_id not in seen_edges:
+                                    result.edges.append(
+                                        KnowledgeGraphEdge(
+                                            id=edge_id,
+                                            type=edge.get("relation", ""),
+                                            source=node_id,
+                                            target=edge["target"],
+                                            properties={
+                                                k: v
+                                                for k, v in edge.items()
+                                                if k not in ["target", "relation"]
+                                            },
+                                        )
+                                    )
+                                    seen_edges.add(edge_id)
+
+            logger.info(
+                f"Subgraph query successful | Node count: {len(result.nodes)} | Edge count: {len(result.edges)}"
+            )
+
+        except PyMongoError as e:
+            logger.error(f"MongoDB query failed: {str(e)}")
+
+        return result
+
+    async def index_done_callback(self) -> None:
+        # Mongo handles persistence automatically
+        pass
+
+
+@final
+@dataclass
+class MongoVectorDBStorage(BaseVectorStorage):
+    db: AsyncIOMotorDatabase | None = field(default=None)
+    _data: AsyncIOMotorCollection | None = field(default=None)
+
+    def __post_init__(self):
+        kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
+        cosine_threshold = kwargs.get("cosine_better_than_threshold")
+        if cosine_threshold is None:
+            raise ValueError(
+                "cosine_better_than_threshold must be specified in vector_db_storage_cls_kwargs"
+            )
+        self.cosine_better_than_threshold = cosine_threshold
+        self._collection_name = self.namespace
+        self._max_batch_size = self.global_config["embedding_batch_num"]
+
+    async def initialize(self):
+        if self.db is None:
+            self.db = await ClientManager.get_client()
+            self._data = await get_or_create_collection(self.db, self._collection_name)
+
+            # Ensure vector index exists
+            await self.create_vector_index_if_not_exists()
+
+            logger.debug(f"Use MongoDB as VDB {self._collection_name}")
+
+    async def finalize(self):
+        if self.db is not None:
+            await ClientManager.release_client(self.db)
+            self.db = None
+            self._data = None
+
+    async def create_vector_index_if_not_exists(self):
+        """Creates an Atlas Vector Search index."""
+        try:
+            index_name = "vector_knn_index"
+
+            indexes = await self._data.list_search_indexes().to_list(length=None)
+            for index in indexes:
+                if index["name"] == index_name:
+                    logger.debug("vector index already exist")
+                    return
+
+            search_index_model = SearchIndexModel(
+                definition={
+                    "fields": [
+                        {
+                            "type": "vector",
+                            "numDimensions": self.embedding_func.embedding_dim,  # Ensure correct dimensions
+                            "path": "vector",
+                            "similarity": "cosine",  # Options: euclidean, cosine, dotProduct
+                        }
+                    ]
+                },
+                name=index_name,
+                type="vectorSearch",
+            )
+
+            await self._data.create_search_index(search_index_model)
+            logger.info("Vector index created successfully.")
+
+        except PyMongoError as _:
+            logger.debug("vector index already exist")
+
+    async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        logger.info(f"Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
+
+        list_data = [
+            {
+                "_id": k,
+                **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
+            }
+            for k, v in data.items()
+        ]
+        contents = [v["content"] for v in data.values()]
+        batches = [
+            contents[i : i + self._max_batch_size]
+            for i in range(0, len(contents), self._max_batch_size)
+        ]
+
+        embedding_tasks = [self.embedding_func(batch) for batch in batches]
+        embeddings_list = await asyncio.gather(*embedding_tasks)
+        embeddings = np.concatenate(embeddings_list)
+        for i, d in enumerate(list_data):
+            d["vector"] = np.array(embeddings[i], dtype=np.float32).tolist()
+
+        update_tasks = []
+        for doc in list_data:
+            update_tasks.append(
+                self._data.update_one({"_id": doc["_id"]}, {"$set": doc}, upsert=True)
+            )
+        await asyncio.gather(*update_tasks)
+
+        return list_data
+
+    async def query(self, query: str, top_k: int) -> list[dict[str, Any]]:
+        """Queries the vector database using Atlas Vector Search."""
+        # Generate the embedding
+        embedding = await self.embedding_func([query])
+
+        # Convert numpy array to a list to ensure compatibility with MongoDB
+        query_vector = embedding[0].tolist()
+
+        # Define the aggregation pipeline with the converted query vector
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "vector_knn_index",  # Ensure this matches the created index name
+                    "path": "vector",
+                    "queryVector": query_vector,
+                    "numCandidates": 100,  # Adjust for performance
+                    "limit": top_k,
+                }
+            },
+            {"$addFields": {"score": {"$meta": "vectorSearchScore"}}},
+            {"$match": {"score": {"$gte": self.cosine_better_than_threshold}}},
+            {"$project": {"vector": 0}},
+        ]
+
+        # Execute the aggregation pipeline
+        cursor = self._data.aggregate(pipeline)
+        results = await cursor.to_list()
+
+        # Format and return the results
+        return [
+            {**doc, "id": doc["_id"], "distance": doc.get("score", None)}
+            for doc in results
+        ]
+
+    async def index_done_callback(self) -> None:
+        # Mongo handles persistence automatically
+        pass
+
+    async def delete_entity(self, entity_name: str) -> None:
+        raise NotImplementedError
+
+    async def delete_entity_relation(self, entity_name: str) -> None:
+        raise NotImplementedError
+
+
+async def get_or_create_collection(db: AsyncIOMotorDatabase, collection_name: str):
+    collection_names = await db.list_collection_names()
+
+    if collection_name not in collection_names:
+        collection = await db.create_collection(collection_name)
+        logger.info(f"Created collection: {collection_name}")
+        return collection
+    else:
+        logger.debug(f"Collection '{collection_name}' already exists.")
+        return db.get_collection(collection_name)

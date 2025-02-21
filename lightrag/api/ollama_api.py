@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 import asyncio
 from ascii_colors import trace_exception
 from lightrag import LightRAG, QueryParam
+from lightrag.utils import encode_string_by_tiktoken
 from dotenv import load_dotenv
 
 
@@ -111,18 +112,9 @@ class OllamaTagResponse(BaseModel):
 
 
 def estimate_tokens(text: str) -> int:
-    """Estimate the number of tokens in text
-    Chinese characters: approximately 1.5 tokens per character
-    English characters: approximately 0.25 tokens per character
-    """
-    # Use regex to match Chinese and non-Chinese characters separately
-    chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
-    non_chinese_chars = len(re.findall(r"[^\u4e00-\u9fff]", text))
-
-    # Calculate estimated token count
-    tokens = chinese_chars * 1.5 + non_chinese_chars * 0.25
-
-    return int(tokens)
+    """Estimate the number of tokens in text using tiktoken"""
+    tokens = encode_string_by_tiktoken(text)
+    return len(tokens)
 
 
 def parse_query_mode(query: str) -> tuple[str, SearchMode]:
@@ -148,9 +140,10 @@ def parse_query_mode(query: str) -> tuple[str, SearchMode]:
 
 
 class OllamaAPI:
-    def __init__(self, rag: LightRAG):
+    def __init__(self, rag: LightRAG, top_k: int = 60):
         self.rag = rag
         self.ollama_server_infos = ollama_server_infos
+        self.top_k = top_k
         self.router = APIRouter()
         self.setup_routes()
 
@@ -315,9 +308,7 @@ class OllamaAPI:
                             "Cache-Control": "no-cache",
                             "Connection": "keep-alive",
                             "Content-Type": "application/x-ndjson",
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Methods": "POST, OPTIONS",
-                            "Access-Control-Allow-Headers": "Content-Type",
+                            "X-Accel-Buffering": "no",  # 确保在Nginx代理时正确处理流式响应
                         },
                     )
                 else:
@@ -381,7 +372,7 @@ class OllamaAPI:
                     "stream": request.stream,
                     "only_need_context": False,
                     "conversation_history": conversation_history,
-                    "top_k": self.rag.args.top_k if hasattr(self.rag, "args") else 50,
+                    "top_k": self.top_k,
                 }
 
                 if (
@@ -533,9 +524,7 @@ class OllamaAPI:
                             "Cache-Control": "no-cache",
                             "Connection": "keep-alive",
                             "Content-Type": "application/x-ndjson",
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Methods": "POST, OPTIONS",
-                            "Access-Control-Allow-Headers": "Content-Type",
+                            "X-Accel-Buffering": "no",  # 确保在Nginx代理时正确处理流式响应
                         },
                     )
                 else:

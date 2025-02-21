@@ -3,10 +3,9 @@ from fastapi import (
     HTTPException,
     File,
     UploadFile,
-    Form,
     BackgroundTasks,
 )
-
+import asyncio
 import threading
 import os
 import json
@@ -14,19 +13,13 @@ import re
 from fastapi.staticfiles import StaticFiles
 import logging
 import argparse
-from typing import List, Any, Optional, Union, Dict
-from pydantic import BaseModel
-from lightrag import LightRAG, QueryParam
-from lightrag.types import GPTKeywordExtractionFormat
-from lightrag.api import __api_version__
-from lightrag.utils import EmbeddingFunc
-from enum import Enum
+from typing import List, Any, Literal, Optional, Dict
+from pydantic import BaseModel, Field, field_validator
 from pathlib import Path
 import shutil
 import aiofiles
 from ascii_colors import trace_exception, ASCIIColors
 import sys
-import configparser
 from fastapi import Depends, Security
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,24 +27,36 @@ from contextlib import asynccontextmanager
 from starlette.status import HTTP_403_FORBIDDEN
 import pipmaster as pm
 from dotenv import load_dotenv
-from .ollama_api import (
-    OllamaAPI,
-)
-from .ollama_api import ollama_server_infos
+import configparser
+import traceback
+from datetime import datetime
+
+from lightrag import LightRAG, QueryParam
+from lightrag.base import DocProcessingStatus, DocStatus
+from lightrag.types import GPTKeywordExtractionFormat
+from lightrag.api import __api_version__
+from lightrag.utils import EmbeddingFunc
+from lightrag.utils import logger
+from .ollama_api import OllamaAPI, ollama_server_infos
+
 
 # Load environment variables
-load_dotenv(override=True)
+try:
+    load_dotenv(override=True)
+except Exception as e:
+    logger.warning(f"Failed to load .env file: {e}")
+
+# Initialize config parser
+config = configparser.ConfigParser()
+config.read("config.ini")
 
 
-class RAGStorageConfig:
+class DefaultRAGStorageConfig:
     KV_STORAGE = "JsonKVStorage"
-    DOC_STATUS_STORAGE = "JsonDocStatusStorage"
-    GRAPH_STORAGE = "NetworkXStorage"
     VECTOR_STORAGE = "NanoVectorDBStorage"
+    GRAPH_STORAGE = "NetworkXStorage"
+    DOC_STATUS_STORAGE = "JsonDocStatusStorage"
 
-
-# Initialize rag storage config
-rag_storage_config = RAGStorageConfig()
 
 # Global progress tracker
 scan_progress: Dict = {
@@ -79,48 +84,6 @@ def estimate_tokens(text: str) -> int:
     tokens = chinese_chars * 1.5 + non_chinese_chars * 0.25
 
     return int(tokens)
-
-
-# read config.ini
-config = configparser.ConfigParser()
-config.read("config.ini", "utf-8")
-# Redis config
-redis_uri = config.get("redis", "uri", fallback=None)
-if redis_uri:
-    os.environ["REDIS_URI"] = redis_uri
-    rag_storage_config.KV_STORAGE = "RedisKVStorage"
-    rag_storage_config.DOC_STATUS_STORAGE = "RedisKVStorage"
-
-# Neo4j config
-neo4j_uri = config.get("neo4j", "uri", fallback=None)
-neo4j_username = config.get("neo4j", "username", fallback=None)
-neo4j_password = config.get("neo4j", "password", fallback=None)
-if neo4j_uri:
-    os.environ["NEO4J_URI"] = neo4j_uri
-    os.environ["NEO4J_USERNAME"] = neo4j_username
-    os.environ["NEO4J_PASSWORD"] = neo4j_password
-    rag_storage_config.GRAPH_STORAGE = "Neo4JStorage"
-
-# Milvus config
-milvus_uri = config.get("milvus", "uri", fallback=None)
-milvus_user = config.get("milvus", "user", fallback=None)
-milvus_password = config.get("milvus", "password", fallback=None)
-milvus_db_name = config.get("milvus", "db_name", fallback=None)
-if milvus_uri:
-    os.environ["MILVUS_URI"] = milvus_uri
-    os.environ["MILVUS_USER"] = milvus_user
-    os.environ["MILVUS_PASSWORD"] = milvus_password
-    os.environ["MILVUS_DB_NAME"] = milvus_db_name
-    rag_storage_config.VECTOR_STORAGE = "MilvusVectorDBStorge"
-
-# MongoDB config
-mongo_uri = config.get("mongodb", "uri", fallback=None)
-mongo_database = config.get("mongodb", "LightRAG", fallback=None)
-if mongo_uri:
-    os.environ["MONGO_URI"] = mongo_uri
-    os.environ["MONGO_DATABASE"] = mongo_database
-    rag_storage_config.KV_STORAGE = "MongoKVStorage"
-    rag_storage_config.DOC_STATUS_STORAGE = "MongoKVStorage"
 
 
 def get_default_host(binding_type: str) -> str:
@@ -151,8 +114,8 @@ def get_env_value(env_key: str, default: Any, value_type: type = str) -> Any:
     if value is None:
         return default
 
-    if isinstance(value_type, bool):
-        return value.lower() in ("true", "1", "yes")
+    if value_type is bool:
+        return value.lower() in ("true", "1", "yes", "t", "on")
     try:
         return value_type(value)
     except ValueError:
@@ -180,8 +143,12 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.host}")
     ASCIIColors.white("    ├─ Port: ", end="")
     ASCIIColors.yellow(f"{args.port}")
-    ASCIIColors.white("    └─ SSL Enabled: ", end="")
+    ASCIIColors.white("    ├─ CORS Origins: ", end="")
+    ASCIIColors.yellow(f"{os.getenv('CORS_ORIGINS', '*')}")
+    ASCIIColors.white("    ├─ SSL Enabled: ", end="")
     ASCIIColors.yellow(f"{args.ssl}")
+    ASCIIColors.white("    └─ API Key: ", end="")
+    ASCIIColors.yellow("Set" if args.key else "Not Set")
     if args.ssl:
         ASCIIColors.white("    ├─ SSL Cert: ", end="")
         ASCIIColors.yellow(f"{args.ssl_certfile}")
@@ -235,15 +202,25 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.top_k}")
 
     # System Configuration
+    ASCIIColors.magenta("\n💾 Storage Configuration:")
+    ASCIIColors.white("    ├─ KV Storage: ", end="")
+    ASCIIColors.yellow(f"{args.kv_storage}")
+    ASCIIColors.white("    ├─ Vector Storage: ", end="")
+    ASCIIColors.yellow(f"{args.vector_storage}")
+    ASCIIColors.white("    ├─ Graph Storage: ", end="")
+    ASCIIColors.yellow(f"{args.graph_storage}")
+    ASCIIColors.white("    └─ Document Status Storage: ", end="")
+    ASCIIColors.yellow(f"{args.doc_status_storage}")
+
     ASCIIColors.magenta("\n🛠️ System Configuration:")
     ASCIIColors.white("    ├─ Ollama Emulating Model: ", end="")
     ASCIIColors.yellow(f"{ollama_server_infos.LIGHTRAG_MODEL}")
     ASCIIColors.white("    ├─ Log Level: ", end="")
     ASCIIColors.yellow(f"{args.log_level}")
-    ASCIIColors.white("    ├─ Timeout: ", end="")
+    ASCIIColors.white("    ├─ Verbose Debug: ", end="")
+    ASCIIColors.yellow(f"{args.verbose}")
+    ASCIIColors.white("    └─ Timeout: ", end="")
     ASCIIColors.yellow(f"{args.timeout if args.timeout else 'None (infinite)'}")
-    ASCIIColors.white("    └─ API Key: ", end="")
-    ASCIIColors.yellow("Set" if args.key else "Not Set")
 
     # Server Status
     ASCIIColors.green("\n✨ Server starting up...\n")
@@ -258,8 +235,10 @@ def display_splash_screen(args: argparse.Namespace) -> None:
         ASCIIColors.yellow(f"{protocol}://<your-ip-address>:{args.port}")
         ASCIIColors.white("    ├─ API Documentation (local): ", end="")
         ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/docs")
-        ASCIIColors.white("    └─ Alternative Documentation (local): ", end="")
+        ASCIIColors.white("    ├─ Alternative Documentation (local): ", end="")
         ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/redoc")
+        ASCIIColors.white("    └─ WebUI (local): ", end="")
+        ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/webui")
 
         ASCIIColors.yellow("\n📝 Note:")
         ASCIIColors.white("""    Since the server is running on 0.0.0.0:
@@ -326,6 +305,35 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description="LightRAG FastAPI Server with separate working and input directories"
+    )
+
+    parser.add_argument(
+        "--kv-storage",
+        default=get_env_value(
+            "LIGHTRAG_KV_STORAGE", DefaultRAGStorageConfig.KV_STORAGE
+        ),
+        help=f"KV storage implementation (default: {DefaultRAGStorageConfig.KV_STORAGE})",
+    )
+    parser.add_argument(
+        "--doc-status-storage",
+        default=get_env_value(
+            "LIGHTRAG_DOC_STATUS_STORAGE", DefaultRAGStorageConfig.DOC_STATUS_STORAGE
+        ),
+        help=f"Document status storage implementation (default: {DefaultRAGStorageConfig.DOC_STATUS_STORAGE})",
+    )
+    parser.add_argument(
+        "--graph-storage",
+        default=get_env_value(
+            "LIGHTRAG_GRAPH_STORAGE", DefaultRAGStorageConfig.GRAPH_STORAGE
+        ),
+        help=f"Graph storage implementation (default: {DefaultRAGStorageConfig.GRAPH_STORAGE})",
+    )
+    parser.add_argument(
+        "--vector-storage",
+        default=get_env_value(
+            "LIGHTRAG_VECTOR_STORAGE", DefaultRAGStorageConfig.VECTOR_STORAGE
+        ),
+        help=f"Vector storage implementation (default: {DefaultRAGStorageConfig.VECTOR_STORAGE})",
     )
 
     # Bindings configuration
@@ -512,13 +520,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--top-k",
         type=int,
-        default=get_env_value("TOP_K", 50, int),
-        help="Number of most similar results to return (default: from env or 50)",
+        default=get_env_value("TOP_K", 60, int),
+        help="Number of most similar results to return (default: from env or 60)",
     )
     parser.add_argument(
         "--cosine-threshold",
         type=float,
-        default=get_env_value("COSINE_THRESHOLD", 0.4, float),
+        default=get_env_value("COSINE_THRESHOLD", 0.2, float),
         help="Cosine similarity threshold (default: from env or 0.4)",
     )
 
@@ -540,7 +548,18 @@ def parse_args() -> argparse.Namespace:
         help="Prefix of the namespace",
     )
 
+    parser.add_argument(
+        "--verbose",
+        type=bool,
+        default=get_env_value("VERBOSE", False, bool),
+        help="Verbose debug output(default: from env or false)",
+    )
+
     args = parser.parse_args()
+
+    # conver relative path to absolute path
+    args.working_dir = os.path.abspath(args.working_dir)
+    args.input_dir = os.path.abspath(args.input_dir)
 
     ollama_server_infos.LIGHTRAG_MODEL = args.simulated_model_name
 
@@ -573,6 +592,7 @@ class DocumentManager:
         """Scan input directory for new files"""
         new_files = []
         for ext in self.supported_extensions:
+            logger.info(f"Scanning for {ext} files in {self.input_dir}")
             for file_path in self.input_dir.rglob(f"*{ext}"):
                 if file_path not in self.indexed_files:
                     new_files.append(file_path)
@@ -595,35 +615,201 @@ class DocumentManager:
         return any(filename.lower().endswith(ext) for ext in self.supported_extensions)
 
 
-# LightRAG query mode
-class SearchMode(str, Enum):
-    naive = "naive"
-    local = "local"
-    global_ = "global"
-    hybrid = "hybrid"
-    mix = "mix"
-
-
 class QueryRequest(BaseModel):
-    query: str
-    mode: SearchMode = SearchMode.hybrid
-    stream: bool = False
-    only_need_context: bool = False
+    query: str = Field(
+        min_length=1,
+        description="The query text",
+    )
+
+    mode: Literal["local", "global", "hybrid", "naive", "mix"] = Field(
+        default="hybrid",
+        description="Query mode",
+    )
+
+    only_need_context: Optional[bool] = Field(
+        default=None,
+        description="If True, only returns the retrieved context without generating a response.",
+    )
+
+    only_need_prompt: Optional[bool] = Field(
+        default=None,
+        description="If True, only returns the generated prompt without producing a response.",
+    )
+
+    response_type: Optional[str] = Field(
+        min_length=1,
+        default=None,
+        description="Defines the response format. Examples: 'Multiple Paragraphs', 'Single Paragraph', 'Bullet Points'.",
+    )
+
+    top_k: Optional[int] = Field(
+        ge=1,
+        default=None,
+        description="Number of top items to retrieve. Represents entities in 'local' mode and relationships in 'global' mode.",
+    )
+
+    max_token_for_text_unit: Optional[int] = Field(
+        gt=1,
+        default=None,
+        description="Maximum number of tokens allowed for each retrieved text chunk.",
+    )
+
+    max_token_for_global_context: Optional[int] = Field(
+        gt=1,
+        default=None,
+        description="Maximum number of tokens allocated for relationship descriptions in global retrieval.",
+    )
+
+    max_token_for_local_context: Optional[int] = Field(
+        gt=1,
+        default=None,
+        description="Maximum number of tokens allocated for entity descriptions in local retrieval.",
+    )
+
+    hl_keywords: Optional[List[str]] = Field(
+        default=None,
+        description="List of high-level keywords to prioritize in retrieval.",
+    )
+
+    ll_keywords: Optional[List[str]] = Field(
+        default=None,
+        description="List of low-level keywords to refine retrieval focus.",
+    )
+
+    conversation_history: Optional[List[dict[str, Any]]] = Field(
+        default=None,
+        description="Stores past conversation history to maintain context. Format: [{'role': 'user/assistant', 'content': 'message'}].",
+    )
+
+    history_turns: Optional[int] = Field(
+        ge=0,
+        default=None,
+        description="Number of complete conversation turns (user-assistant pairs) to consider in the response context.",
+    )
+
+    @field_validator("query", mode="after")
+    @classmethod
+    def query_strip_after(cls, query: str) -> str:
+        return query.strip()
+
+    @field_validator("hl_keywords", mode="after")
+    @classmethod
+    def hl_keywords_strip_after(cls, hl_keywords: List[str] | None) -> List[str] | None:
+        if hl_keywords is None:
+            return None
+        return [keyword.strip() for keyword in hl_keywords]
+
+    @field_validator("ll_keywords", mode="after")
+    @classmethod
+    def ll_keywords_strip_after(cls, ll_keywords: List[str] | None) -> List[str] | None:
+        if ll_keywords is None:
+            return None
+        return [keyword.strip() for keyword in ll_keywords]
+
+    @field_validator("conversation_history", mode="after")
+    @classmethod
+    def conversation_history_role_check(
+        cls, conversation_history: List[dict[str, Any]] | None
+    ) -> List[dict[str, Any]] | None:
+        if conversation_history is None:
+            return None
+        for msg in conversation_history:
+            if "role" not in msg or msg["role"] not in {"user", "assistant"}:
+                raise ValueError(
+                    "Each message must have a 'role' key with value 'user' or 'assistant'."
+                )
+        return conversation_history
+
+    def to_query_params(self, is_stream: bool) -> QueryParam:
+        """Converts a QueryRequest instance into a QueryParam instance."""
+        # Use Pydantic's `.model_dump(exclude_none=True)` to remove None values automatically
+        request_data = self.model_dump(exclude_none=True, exclude={"query"})
+
+        # Ensure `mode` and `stream` are set explicitly
+        param = QueryParam(**request_data)
+        param.stream = is_stream
+        return param
 
 
 class QueryResponse(BaseModel):
-    response: str
+    response: str = Field(
+        description="The generated response",
+    )
 
 
 class InsertTextRequest(BaseModel):
-    text: str
-    description: Optional[str] = None
+    text: str = Field(
+        min_length=1,
+        description="The text to insert",
+    )
+
+    @field_validator("text", mode="after")
+    @classmethod
+    def strip_after(cls, text: str) -> str:
+        return text.strip()
+
+
+class InsertTextsRequest(BaseModel):
+    texts: list[str] = Field(
+        min_length=1,
+        description="The texts to insert",
+    )
+
+    @field_validator("texts", mode="after")
+    @classmethod
+    def strip_after(cls, texts: list[str]) -> list[str]:
+        return [text.strip() for text in texts]
 
 
 class InsertResponse(BaseModel):
-    status: str
-    message: str
-    document_count: int
+    status: str = Field(description="Status of the operation")
+    message: str = Field(description="Message describing the operation result")
+
+
+class DocStatusResponse(BaseModel):
+    @staticmethod
+    def format_datetime(dt: Any) -> Optional[str]:
+        """Format datetime to ISO string
+
+        Args:
+            dt: Datetime object or string
+
+        Returns:
+            Formatted datetime string or None
+        """
+        if dt is None:
+            return None
+        if isinstance(dt, str):
+            return dt
+        return dt.isoformat()
+
+    """Response model for document status
+
+    Attributes:
+        id: Document identifier
+        content_summary: Summary of document content
+        content_length: Length of document content
+        status: Current processing status
+        created_at: Creation timestamp (ISO format string)
+        updated_at: Last update timestamp (ISO format string)
+        chunks_count: Number of chunks (optional)
+        error: Error message if any (optional)
+        metadata: Additional metadata (optional)
+    """
+
+    id: str
+    content_summary: str
+    content_length: int
+    status: DocStatus
+    created_at: str
+    updated_at: str
+    chunks_count: Optional[int] = None
+    error: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+
+
+class DocsStatusesResponse(BaseModel):
+    statuses: Dict[DocStatus, List[DocStatusResponse]] = {}
 
 
 def get_api_key_dependency(api_key: Optional[str]):
@@ -637,7 +823,9 @@ def get_api_key_dependency(api_key: Optional[str]):
     # If API key is configured, use proper authentication
     api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-    async def api_key_auth(api_key_header_value: str | None = Security(api_key_header)):
+    async def api_key_auth(
+        api_key_header_value: Optional[str] = Security(api_key_header),
+    ):
         if not api_key_header_value:
             raise HTTPException(
                 status_code=HTTP_403_FORBIDDEN, detail="API Key required"
@@ -651,7 +839,20 @@ def get_api_key_dependency(api_key: Optional[str]):
     return api_key_auth
 
 
+# Global configuration
+global_top_k = 60  # default value
+temp_prefix = "__tmp_"  # prefix for temporary files
+
+
 def create_app(args):
+    # Initialize verbose debug setting
+    from lightrag.utils import set_verbose_debug
+
+    set_verbose_debug(args.verbose)
+
+    global global_top_k
+    global_top_k = args.top_k  # save top_k from args
+
     # Verify that bindings are correctly setup
     if args.llm_binding not in [
         "lollms",
@@ -697,25 +898,38 @@ def create_app(args):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
-        # Startup logic
-        if args.auto_scan_at_startup:
-            try:
-                new_files = doc_manager.scan_directory_for_new_files()
-                for file_path in new_files:
-                    try:
-                        await index_file(file_path)
-                    except Exception as e:
-                        trace_exception(e)
-                        logging.error(f"Error indexing file {file_path}: {str(e)}")
+        # Store background tasks
+        app.state.background_tasks = set()
 
-                ASCIIColors.info(
-                    f"Indexed {len(new_files)} documents from {args.input_dir}"
-                )
-            except Exception as e:
-                logging.error(f"Error during startup indexing: {str(e)}")
-        yield
-        # Cleanup logic (if needed)
-        pass
+        try:
+            # Initialize database connections
+            await rag.initialize_storages()
+
+            # Auto scan documents if enabled
+            if args.auto_scan_at_startup:
+                # Start scanning in background
+                with progress_lock:
+                    if not scan_progress["is_scanning"]:
+                        scan_progress["is_scanning"] = True
+                        scan_progress["indexed_count"] = 0
+                        scan_progress["progress"] = 0
+                        # Create background task
+                        task = asyncio.create_task(run_scanning_process())
+                        app.state.background_tasks.add(task)
+                        task.add_done_callback(app.state.background_tasks.discard)
+                        ASCIIColors.info(
+                            f"Started background scanning of documents from {args.input_dir}"
+                        )
+                    else:
+                        ASCIIColors.info(
+                            "Skip document scanning(anohter scanning is active)"
+                        )
+
+            yield
+
+        finally:
+            # Clean up database connections
+            await rag.finalize_storages()
 
     # Initialize FastAPI
     app = FastAPI(
@@ -729,10 +943,19 @@ def create_app(args):
         lifespan=lifespan,
     )
 
+    def get_cors_origins():
+        """Get allowed origins from environment variable
+        Returns a list of allowed origins, defaults to ["*"] if not set
+        """
+        origins_str = os.getenv("CORS_ORIGINS", "*")
+        if origins_str == "*":
+            return ["*"]
+        return [origin.strip() for origin in origins_str.split(",")]
+
     # Add CORS middleware
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=get_cors_origins(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -828,7 +1051,8 @@ def create_app(args):
         if args.embedding_binding == "azure_openai"
         else openai_embed(
             texts,
-            model=args.embedding_model,  # no host is used for openai,
+            model=args.embedding_model,
+            base_url=args.embedding_binding_host,
             api_key=args.embedding_binding_api_key,
         ),
     )
@@ -856,10 +1080,10 @@ def create_app(args):
             if args.llm_binding == "lollms" or args.llm_binding == "ollama"
             else {},
             embedding_func=embedding_func,
-            kv_storage=rag_storage_config.KV_STORAGE,
-            graph_storage=rag_storage_config.GRAPH_STORAGE,
-            vector_storage=rag_storage_config.VECTOR_STORAGE,
-            doc_status_storage=rag_storage_config.DOC_STATUS_STORAGE,
+            kv_storage=args.kv_storage,
+            graph_storage=args.graph_storage,
+            vector_storage=args.vector_storage,
+            doc_status_storage=args.doc_status_storage,
             vector_db_storage_cls_kwargs={
                 "cosine_better_than_threshold": args.cosine_threshold
             },
@@ -871,6 +1095,7 @@ def create_app(args):
             },
             log_level=args.log_level,
             namespace_prefix=args.namespace_prefix,
+            auto_manage_storages_states=False,
         )
     else:
         rag = LightRAG(
@@ -887,10 +1112,10 @@ def create_app(args):
             llm_model_max_async=args.max_async,
             llm_model_max_token_size=args.max_tokens,
             embedding_func=embedding_func,
-            kv_storage=rag_storage_config.KV_STORAGE,
-            graph_storage=rag_storage_config.GRAPH_STORAGE,
-            vector_storage=rag_storage_config.VECTOR_STORAGE,
-            doc_status_storage=rag_storage_config.DOC_STATUS_STORAGE,
+            kv_storage=args.kv_storage,
+            graph_storage=args.graph_storage,
+            vector_storage=args.vector_storage,
+            doc_status_storage=args.doc_status_storage,
             vector_db_storage_cls_kwargs={
                 "cosine_better_than_threshold": args.cosine_threshold
             },
@@ -902,57 +1127,214 @@ def create_app(args):
             },
             log_level=args.log_level,
             namespace_prefix=args.namespace_prefix,
+            auto_manage_storages_states=False,
         )
 
-    async def index_file(file_path: Union[str, Path]) -> None:
-        """Index all files inside the folder with support for multiple file formats
+    async def pipeline_enqueue_file(file_path: Path) -> bool:
+        """Add a file to the queue for processing
 
         Args:
-            file_path: Path to the file to be indexed (str or Path object)
-
-        Raises:
-            ValueError: If file format is not supported
-            FileNotFoundError: If file doesn't exist
+            file_path: Path to the saved file
+        Returns:
+            bool: True if the file was successfully enqueued, False otherwise
         """
-        if not pm.is_installed("aiofiles"):
-            pm.install("aiofiles")
+        try:
+            content = ""
+            ext = file_path.suffix.lower()
 
-        # Convert to Path object if string
-        file_path = Path(file_path)
+            file = None
+            async with aiofiles.open(file_path, "rb") as f:
+                file = await f.read()
 
-        # Check if file exists
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+            # Process based on file type
+            match ext:
+                case ".txt" | ".md":
+                    content = file.decode("utf-8")
+                case ".pdf":
+                    if not pm.is_installed("pypdf2"):
+                        pm.install("pypdf2")
+                    from PyPDF2 import PdfReader  # type: ignore
+                    from io import BytesIO
 
-        content = ""
-        # Get file extension in lowercase
-        ext = file_path.suffix.lower()
+                    pdf_file = BytesIO(file)
+                    reader = PdfReader(pdf_file)
+                    for page in reader.pages:
+                        content += page.extract_text() + "\n"
+                case ".docx":
+                    if not pm.is_installed("docx"):
+                        pm.install("docx")
+                    from docx import Document
+                    from io import BytesIO
 
-        match ext:
-            case ".txt" | ".md":
-                # Text files handling
-                async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
-                    content = await f.read()
+                    docx_file = BytesIO(file)
+                    doc = Document(docx_file)
+                    content = "\n".join(
+                        [paragraph.text for paragraph in doc.paragraphs]
+                    )
+                case ".pptx":
+                    if not pm.is_installed("pptx"):
+                        pm.install("pptx")
+                    from pptx import Presentation  # type: ignore
+                    from io import BytesIO
 
-            case ".pdf" | ".docx" | ".pptx" | ".xlsx":
-                if not pm.is_installed("docling"):
-                    pm.install("docling")
-                from docling.document_converter import DocumentConverter
+                    pptx_file = BytesIO(file)
+                    prs = Presentation(pptx_file)
+                    for slide in prs.slides:
+                        for shape in slide.shapes:
+                            if hasattr(shape, "text"):
+                                content += shape.text + "\n"
+                case ".xlsx":
+                    if not pm.is_installed("openpyxl"):
+                        pm.install("openpyxl")
+                    from openpyxl import load_workbook  # type: ignore
+                    from io import BytesIO
 
-                converter = DocumentConverter()
-                result = converter.convert(file_path)
-                content = result.document.export_to_markdown()
+                    xlsx_file = BytesIO(file)
+                    wb = load_workbook(xlsx_file)
+                    for sheet in wb:
+                        content += f"Sheet: {sheet.title}\n"
+                        for row in sheet.iter_rows(values_only=True):
+                            content += (
+                                "\t".join(
+                                    str(cell) if cell is not None else ""
+                                    for cell in row
+                                )
+                                + "\n"
+                            )
+                        content += "\n"
+                case _:
+                    logging.error(
+                        f"Unsupported file type: {file_path.name} (extension {ext})"
+                    )
+                    return False
 
-            case _:
-                raise ValueError(f"Unsupported file format: {ext}")
+            # Insert into the RAG queue
+            if content:
+                await rag.apipeline_enqueue_documents(content)
+                logging.info(
+                    f"Successfully fetched and enqueued file: {file_path.name}"
+                )
+                return True
+            else:
+                logging.error(
+                    f"No content could be extracted from file: {file_path.name}"
+                )
 
-        # Insert content into RAG system
-        if content:
-            await rag.ainsert(content)
-            doc_manager.mark_as_indexed(file_path)
-            logging.info(f"Successfully indexed file: {file_path}")
-        else:
-            logging.warning(f"No content extracted from file: {file_path}")
+        except Exception as e:
+            logging.error(
+                f"Error processing or enqueueing file {file_path.name}: {str(e)}"
+            )
+            logging.error(traceback.format_exc())
+        finally:
+            if file_path.name.startswith(temp_prefix):
+                # Clean up the temporary file after indexing
+                try:
+                    file_path.unlink()
+                except Exception as e:
+                    logging.error(f"Error deleting file {file_path}: {str(e)}")
+        return False
+
+    async def pipeline_index_file(file_path: Path):
+        """Index a file
+
+        Args:
+            file_path: Path to the saved file
+        """
+        try:
+            if await pipeline_enqueue_file(file_path):
+                await rag.apipeline_process_enqueue_documents()
+
+        except Exception as e:
+            logging.error(f"Error indexing file {file_path.name}: {str(e)}")
+            logging.error(traceback.format_exc())
+
+    async def pipeline_index_files(file_paths: List[Path]):
+        """Index multiple files concurrently
+
+        Args:
+            file_paths: Paths to the files to index
+        """
+        if not file_paths:
+            return
+        try:
+            enqueued = False
+
+            if len(file_paths) == 1:
+                enqueued = await pipeline_enqueue_file(file_paths[0])
+            else:
+                tasks = [pipeline_enqueue_file(path) for path in file_paths]
+                enqueued = any(await asyncio.gather(*tasks))
+
+            if enqueued:
+                await rag.apipeline_process_enqueue_documents()
+        except Exception as e:
+            logging.error(f"Error indexing files: {str(e)}")
+            logging.error(traceback.format_exc())
+
+    async def pipeline_index_texts(texts: List[str]):
+        """Index a list of texts
+
+        Args:
+            texts: The texts to index
+        """
+        if not texts:
+            return
+        await rag.apipeline_enqueue_documents(texts)
+        await rag.apipeline_process_enqueue_documents()
+
+    async def save_temp_file(file: UploadFile = File(...)) -> Path:
+        """Save the uploaded file to a temporary location
+
+        Args:
+            file: The uploaded file
+
+        Returns:
+            Path: The path to the saved file
+        """
+        # Generate unique filename to avoid conflicts
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_filename = f"{temp_prefix}{timestamp}_{file.filename}"
+
+        # Create a temporary file to save the uploaded content
+        temp_path = doc_manager.input_dir / "temp" / unique_filename
+        temp_path.parent.mkdir(exist_ok=True)
+
+        # Save the file
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        return temp_path
+
+    async def run_scanning_process():
+        """Background task to scan and index documents"""
+        global scan_progress
+
+        try:
+            new_files = doc_manager.scan_directory_for_new_files()
+            scan_progress["total_files"] = len(new_files)
+
+            logger.info(f"Found {len(new_files)} new files to index.")
+            for file_path in new_files:
+                try:
+                    with progress_lock:
+                        scan_progress["current_file"] = os.path.basename(file_path)
+
+                    await pipeline_index_file(file_path)
+
+                    with progress_lock:
+                        scan_progress["indexed_count"] += 1
+                        scan_progress["progress"] = (
+                            scan_progress["indexed_count"]
+                            / scan_progress["total_files"]
+                        ) * 100
+
+                except Exception as e:
+                    logging.error(f"Error indexing file {file_path}: {str(e)}")
+
+        except Exception as e:
+            logging.error(f"Error during scanning process: {str(e)}")
+        finally:
+            with progress_lock:
+                scan_progress["is_scanning"] = False
 
     @app.post("/documents/scan", dependencies=[Depends(optional_api_key)])
     async def scan_for_new_documents(background_tasks: BackgroundTasks):
@@ -972,37 +1354,6 @@ def create_app(args):
 
         return {"status": "scanning_started"}
 
-    async def run_scanning_process():
-        """Background task to scan and index documents"""
-        global scan_progress
-
-        try:
-            new_files = doc_manager.scan_directory_for_new_files()
-            scan_progress["total_files"] = len(new_files)
-
-            for file_path in new_files:
-                try:
-                    with progress_lock:
-                        scan_progress["current_file"] = os.path.basename(file_path)
-
-                    await index_file(file_path)
-
-                    with progress_lock:
-                        scan_progress["indexed_count"] += 1
-                        scan_progress["progress"] = (
-                            scan_progress["indexed_count"]
-                            / scan_progress["total_files"]
-                        ) * 100
-
-                except Exception as e:
-                    logging.error(f"Error indexing file {file_path}: {str(e)}")
-
-        except Exception as e:
-            logging.error(f"Error during scanning process: {str(e)}")
-        finally:
-            with progress_lock:
-                scan_progress["is_scanning"] = False
-
     @app.get("/documents/scan-progress")
     async def get_scan_progress():
         """Get the current scanning progress"""
@@ -1010,7 +1361,9 @@ def create_app(args):
             return scan_progress
 
     @app.post("/documents/upload", dependencies=[Depends(optional_api_key)])
-    async def upload_to_input_dir(file: UploadFile = File(...)):
+    async def upload_to_input_dir(
+        background_tasks: BackgroundTasks, file: UploadFile = File(...)
+    ):
         """
         Endpoint for uploading a file to the input directory and indexing it.
 
@@ -1019,6 +1372,7 @@ def create_app(args):
         indexes it for retrieval, and returns a success status with relevant details.
 
         Parameters:
+            background_tasks: FastAPI BackgroundTasks for async processing
             file (UploadFile): The file to be uploaded. It must have an allowed extension as per
                                `doc_manager.supported_extensions`.
 
@@ -1043,15 +1397,206 @@ def create_app(args):
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
-            # Immediately index the uploaded file
-            await index_file(file_path)
+            # Add to background tasks
+            background_tasks.add_task(pipeline_index_file, file_path)
 
-            return {
-                "status": "success",
-                "message": f"File uploaded and indexed: {file.filename}",
-                "total_documents": len(doc_manager.indexed_files),
-            }
+            return InsertResponse(
+                status="success",
+                message=f"File '{file.filename}' uploaded successfully. Processing will continue in background.",
+            )
         except Exception as e:
+            logging.error(f"Error /documents/upload: {file.filename}: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/documents/text",
+        response_model=InsertResponse,
+        dependencies=[Depends(optional_api_key)],
+    )
+    async def insert_text(
+        request: InsertTextRequest, background_tasks: BackgroundTasks
+    ):
+        """
+        Insert text into the Retrieval-Augmented Generation (RAG) system.
+
+        This endpoint allows you to insert text data into the RAG system for later retrieval and use in generating responses.
+
+        Args:
+            request (InsertTextRequest): The request body containing the text to be inserted.
+            background_tasks: FastAPI BackgroundTasks for async processing
+
+        Returns:
+            InsertResponse: A response object containing the status of the operation, a message, and the number of documents inserted.
+        """
+        try:
+            background_tasks.add_task(pipeline_index_texts, [request.text])
+            return InsertResponse(
+                status="success",
+                message="Text successfully received. Processing will continue in background.",
+            )
+        except Exception as e:
+            logging.error(f"Error /documents/text: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/documents/texts",
+        response_model=InsertResponse,
+        dependencies=[Depends(optional_api_key)],
+    )
+    async def insert_texts(
+        request: InsertTextsRequest, background_tasks: BackgroundTasks
+    ):
+        """
+        Insert texts into the Retrieval-Augmented Generation (RAG) system.
+
+        This endpoint allows you to insert text data into the RAG system for later retrieval and use in generating responses.
+
+        Args:
+            request (InsertTextsRequest): The request body containing the text to be inserted.
+            background_tasks: FastAPI BackgroundTasks for async processing
+
+        Returns:
+            InsertResponse: A response object containing the status of the operation, a message, and the number of documents inserted.
+        """
+        try:
+            background_tasks.add_task(pipeline_index_texts, request.texts)
+            return InsertResponse(
+                status="success",
+                message="Text successfully received. Processing will continue in background.",
+            )
+        except Exception as e:
+            logging.error(f"Error /documents/text: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/documents/file",
+        response_model=InsertResponse,
+        dependencies=[Depends(optional_api_key)],
+    )
+    async def insert_file(
+        background_tasks: BackgroundTasks, file: UploadFile = File(...)
+    ):
+        """Insert a file directly into the RAG system
+
+        Args:
+            background_tasks: FastAPI BackgroundTasks for async processing
+            file: Uploaded file
+
+        Returns:
+            InsertResponse: Status of the insertion operation
+
+        Raises:
+            HTTPException: For unsupported file types or processing errors
+        """
+        try:
+            if not doc_manager.is_supported_file(file.filename):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
+                )
+
+            # Create a temporary file to save the uploaded content
+            temp_path = save_temp_file(file)
+
+            # Add to background tasks
+            background_tasks.add_task(pipeline_index_file, temp_path)
+
+            return InsertResponse(
+                status="success",
+                message=f"File '{file.filename}' saved successfully. Processing will continue in background.",
+            )
+
+        except Exception as e:
+            logging.error(f"Error /documents/file: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/documents/file_batch",
+        response_model=InsertResponse,
+        dependencies=[Depends(optional_api_key)],
+    )
+    async def insert_batch(
+        background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)
+    ):
+        """Process multiple files in batch mode
+
+        Args:
+            background_tasks: FastAPI BackgroundTasks for async processing
+            files: List of files to process
+
+        Returns:
+            InsertResponse: Status of the batch insertion operation
+
+        Raises:
+            HTTPException: For processing errors
+        """
+        try:
+            inserted_count = 0
+            failed_files = []
+            temp_files = []
+
+            for file in files:
+                if doc_manager.is_supported_file(file.filename):
+                    # Create a temporary file to save the uploaded content
+                    temp_files.append(save_temp_file(file))
+                    inserted_count += 1
+                else:
+                    failed_files.append(f"{file.filename} (unsupported type)")
+
+            if temp_files:
+                background_tasks.add_task(pipeline_index_files, temp_files)
+
+            # Prepare status message
+            if inserted_count == len(files):
+                status = "success"
+                status_message = f"Successfully inserted all {inserted_count} documents"
+            elif inserted_count > 0:
+                status = "partial_success"
+                status_message = f"Successfully inserted {inserted_count} out of {len(files)} documents"
+                if failed_files:
+                    status_message += f". Failed files: {', '.join(failed_files)}"
+            else:
+                status = "failure"
+                status_message = "No documents were successfully inserted"
+                if failed_files:
+                    status_message += f". Failed files: {', '.join(failed_files)}"
+
+            return InsertResponse(status=status, message=status_message)
+
+        except Exception as e:
+            logging.error(f"Error /documents/batch: {file.filename}: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete(
+        "/documents",
+        response_model=InsertResponse,
+        dependencies=[Depends(optional_api_key)],
+    )
+    async def clear_documents():
+        """
+        Clear all documents from the LightRAG system.
+
+        This endpoint deletes all text chunks, entities vector database, and relationships vector database,
+        effectively clearing all documents from the LightRAG system.
+
+        Returns:
+            InsertResponse: A response object containing the status, message, and the new document count (0 in this case).
+        """
+        try:
+            rag.text_chunks = []
+            rag.entities_vdb = None
+            rag.relationships_vdb = None
+            return InsertResponse(
+                status="success", message="All documents cleared successfully"
+            )
+        except Exception as e:
+            logging.error(f"Error DELETE /documents: {str(e)}")
+            logging.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(
@@ -1062,12 +1607,7 @@ def create_app(args):
         Handle a POST request at the /query endpoint to process user queries using RAG capabilities.
 
         Parameters:
-            request (QueryRequest): A Pydantic model containing the following fields:
-                - query (str): The text of the user's query.
-                - mode (ModeEnum): Optional. Specifies the mode of retrieval augmentation.
-                - stream (bool): Optional. Determines if the response should be streamed.
-                - only_need_context (bool): Optional. If true, returns only the context without further processing.
-
+            request (QueryRequest): The request object containing the query parameters.
         Returns:
             QueryResponse: A Pydantic model containing the result of the query processing.
                            If a string is returned (e.g., cache hit), it's directly returned.
@@ -1079,30 +1619,18 @@ def create_app(args):
         """
         try:
             response = await rag.aquery(
-                request.query,
-                param=QueryParam(
-                    mode=request.mode,
-                    stream=request.stream,
-                    only_need_context=request.only_need_context,
-                    top_k=args.top_k,
-                ),
+                request.query, param=request.to_query_params(False)
             )
 
             # If response is a string (e.g. cache hit), return directly
             if isinstance(response, str):
                 return QueryResponse(response=response)
 
-            # If it's an async generator, decide whether to stream based on stream parameter
-            if request.stream:
-                result = ""
-                async for chunk in response:
-                    result += chunk
+            if isinstance(response, dict):
+                result = json.dumps(response, indent=2)
                 return QueryResponse(response=result)
             else:
-                result = ""
-                async for chunk in response:
-                    result += chunk
-                return QueryResponse(response=result)
+                return QueryResponse(response=str(response))
         except Exception as e:
             trace_exception(e)
             raise HTTPException(status_code=500, detail=str(e))
@@ -1120,14 +1648,8 @@ def create_app(args):
             StreamingResponse: A streaming response containing the RAG query results.
         """
         try:
-            response = await rag.aquery(  # Use aquery instead of query, and add await
-                request.query,
-                param=QueryParam(
-                    mode=request.mode,
-                    stream=True,
-                    only_need_context=request.only_need_context,
-                    top_k=args.top_k,
-                ),
+            response = await rag.aquery(
+                request.query, param=request.to_query_params(True)
             )
 
             from fastapi.responses import StreamingResponse
@@ -1153,256 +1675,11 @@ def create_app(args):
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "Content-Type": "application/x-ndjson",
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "POST, OPTIONS",
-                    "Access-Control-Allow-Headers": "Content-Type",
-                    "X-Accel-Buffering": "no",  # Disable Nginx buffering
+                    "X-Accel-Buffering": "no",  # Ensure proper handling of streaming response when proxied by Nginx
                 },
             )
         except Exception as e:
             trace_exception(e)
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.post(
-        "/documents/text",
-        response_model=InsertResponse,
-        dependencies=[Depends(optional_api_key)],
-    )
-    async def insert_text(request: InsertTextRequest):
-        """
-        Insert text into the Retrieval-Augmented Generation (RAG) system.
-
-        This endpoint allows you to insert text data into the RAG system for later retrieval and use in generating responses.
-
-        Args:
-            request (InsertTextRequest): The request body containing the text to be inserted.
-
-        Returns:
-            InsertResponse: A response object containing the status of the operation, a message, and the number of documents inserted.
-        """
-        try:
-            await rag.ainsert(request.text)
-            return InsertResponse(
-                status="success",
-                message="Text successfully inserted",
-                document_count=1,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.post(
-        "/documents/file",
-        response_model=InsertResponse,
-        dependencies=[Depends(optional_api_key)],
-    )
-    async def insert_file(file: UploadFile = File(...), description: str = Form(None)):
-        """Insert a file directly into the RAG system
-
-        Args:
-            file: Uploaded file
-            description: Optional description of the file
-
-        Returns:
-            InsertResponse: Status of the insertion operation
-
-        Raises:
-            HTTPException: For unsupported file types or processing errors
-        """
-        try:
-            content = ""
-            # Get file extension in lowercase
-            ext = Path(file.filename).suffix.lower()
-
-            match ext:
-                case ".txt" | ".md":
-                    # Text files handling
-                    text_content = await file.read()
-                    content = text_content.decode("utf-8")
-
-                case ".pdf" | ".docx" | ".pptx" | ".xlsx":
-                    if not pm.is_installed("docling"):
-                        pm.install("docling")
-                    from docling.document_converter import DocumentConverter
-
-                    # Create a temporary file to save the uploaded content
-                    temp_path = Path("temp") / file.filename
-                    temp_path.parent.mkdir(exist_ok=True)
-
-                    # Save the uploaded file
-                    with temp_path.open("wb") as f:
-                        f.write(await file.read())
-
-                    try:
-                        converter = DocumentConverter()
-                        result = converter.convert(str(temp_path))
-                        content = result.document.export_to_markdown()
-                    finally:
-                        # Clean up the temporary file
-                        temp_path.unlink()
-
-            # Insert content into RAG system
-            if content:
-                # Add description if provided
-                if description:
-                    content = f"{description}\n\n{content}"
-
-                await rag.ainsert(content)
-                logging.info(f"Successfully indexed file: {file.filename}")
-
-                return InsertResponse(
-                    status="success",
-                    message=f"File '{file.filename}' successfully inserted",
-                    document_count=1,
-                )
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="No content could be extracted from the file",
-                )
-
-        except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="File encoding not supported")
-        except Exception as e:
-            logging.error(f"Error processing file {file.filename}: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.post(
-        "/documents/batch",
-        response_model=InsertResponse,
-        dependencies=[Depends(optional_api_key)],
-    )
-    async def insert_batch(files: List[UploadFile] = File(...)):
-        """Process multiple files in batch mode
-
-        Args:
-            files: List of files to process
-
-        Returns:
-            InsertResponse: Status of the batch insertion operation
-
-        Raises:
-            HTTPException: For processing errors
-        """
-        try:
-            inserted_count = 0
-            failed_files = []
-
-            for file in files:
-                try:
-                    content = ""
-                    ext = Path(file.filename).suffix.lower()
-
-                    match ext:
-                        case ".txt" | ".md":
-                            text_content = await file.read()
-                            content = text_content.decode("utf-8")
-
-                        case ".pdf":
-                            if not pm.is_installed("pypdf2"):
-                                pm.install("pypdf2")
-                            from PyPDF2 import PdfReader
-                            from io import BytesIO
-
-                            pdf_content = await file.read()
-                            pdf_file = BytesIO(pdf_content)
-                            reader = PdfReader(pdf_file)
-                            for page in reader.pages:
-                                content += page.extract_text() + "\n"
-
-                        case ".docx":
-                            if not pm.is_installed("docx"):
-                                pm.install("docx")
-                            from docx import Document
-                            from io import BytesIO
-
-                            docx_content = await file.read()
-                            docx_file = BytesIO(docx_content)
-                            doc = Document(docx_file)
-                            content = "\n".join(
-                                [paragraph.text for paragraph in doc.paragraphs]
-                            )
-
-                        case ".pptx":
-                            if not pm.is_installed("pptx"):
-                                pm.install("pptx")
-                            from pptx import Presentation  # type: ignore
-                            from io import BytesIO
-
-                            pptx_content = await file.read()
-                            pptx_file = BytesIO(pptx_content)
-                            prs = Presentation(pptx_file)
-                            for slide in prs.slides:
-                                for shape in slide.shapes:
-                                    if hasattr(shape, "text"):
-                                        content += shape.text + "\n"
-
-                        case _:
-                            failed_files.append(f"{file.filename} (unsupported type)")
-                            continue
-
-                    if content:
-                        await rag.ainsert(content)
-                        inserted_count += 1
-                        logging.info(f"Successfully indexed file: {file.filename}")
-                    else:
-                        failed_files.append(f"{file.filename} (no content extracted)")
-
-                except UnicodeDecodeError:
-                    failed_files.append(f"{file.filename} (encoding error)")
-                except Exception as e:
-                    failed_files.append(f"{file.filename} ({str(e)})")
-                    logging.error(f"Error processing file {file.filename}: {str(e)}")
-
-            # Prepare status message
-            if inserted_count == len(files):
-                status = "success"
-                status_message = f"Successfully inserted all {inserted_count} documents"
-            elif inserted_count > 0:
-                status = "partial_success"
-                status_message = f"Successfully inserted {inserted_count} out of {len(files)} documents"
-                if failed_files:
-                    status_message += f". Failed files: {', '.join(failed_files)}"
-            else:
-                status = "failure"
-                status_message = "No documents were successfully inserted"
-                if failed_files:
-                    status_message += f". Failed files: {', '.join(failed_files)}"
-
-            return InsertResponse(
-                status=status,
-                message=status_message,
-                document_count=inserted_count,
-            )
-
-        except Exception as e:
-            logging.error(f"Batch processing error: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.delete(
-        "/documents",
-        response_model=InsertResponse,
-        dependencies=[Depends(optional_api_key)],
-    )
-    async def clear_documents():
-        """
-        Clear all documents from the LightRAG system.
-
-        This endpoint deletes all text chunks, entities vector database, and relationships vector database,
-        effectively clearing all documents from the LightRAG system.
-
-        Returns:
-            InsertResponse: A response object containing the status, message, and the new document count (0 in this case).
-        """
-        try:
-            rag.text_chunks = []
-            rag.entities_vdb = None
-            rag.relationships_vdb = None
-            return InsertResponse(
-                status="success",
-                message="All documents cleared successfully",
-                document_count=0,
-            )
-        except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
     # query all graph labels
@@ -1412,28 +1689,69 @@ def create_app(args):
 
     # query all graph
     @app.get("/graphs")
-    async def get_graphs(label: str):
-        return await rag.get_graps(nodel_label=label, max_depth=100)
+    async def get_knowledge_graph(label: str):
+        return await rag.get_knowledge_graph(nodel_label=label, max_depth=100)
 
     # Add Ollama API routes
-    ollama_api = OllamaAPI(rag)
+    ollama_api = OllamaAPI(rag, top_k=args.top_k)
     app.include_router(ollama_api.router, prefix="/api")
 
     @app.get("/documents", dependencies=[Depends(optional_api_key)])
-    async def documents():
-        """Get current system status"""
-        return doc_manager.indexed_files
+    async def documents() -> DocsStatusesResponse:
+        """
+        Get documents statuses
+        Returns:
+            DocsStatusesResponse: A response object containing a dictionary where keys are DocStatus
+            and values are lists of DocStatusResponse objects representing documents in each status category.
+        """
+        try:
+            statuses = (
+                DocStatus.PENDING,
+                DocStatus.PROCESSING,
+                DocStatus.PROCESSED,
+                DocStatus.FAILED,
+            )
+
+            tasks = [rag.get_docs_by_status(status) for status in statuses]
+            results: List[Dict[str, DocProcessingStatus]] = await asyncio.gather(*tasks)
+
+            response = DocsStatusesResponse()
+
+            for idx, result in enumerate(results):
+                status = statuses[idx]
+                for doc_id, doc_status in result.items():
+                    if status not in response.statuses:
+                        response.statuses[status] = []
+                    response.statuses[status].append(
+                        DocStatusResponse(
+                            id=doc_id,
+                            content_summary=doc_status.content_summary,
+                            content_length=doc_status.content_length,
+                            status=doc_status.status,
+                            created_at=DocStatusResponse.format_datetime(
+                                doc_status.created_at
+                            ),
+                            updated_at=DocStatusResponse.format_datetime(
+                                doc_status.updated_at
+                            ),
+                            chunks_count=doc_status.chunks_count,
+                            error=doc_status.error,
+                            metadata=doc_status.metadata,
+                        )
+                    )
+            return response
+        except Exception as e:
+            logging.error(f"Error GET /documents: {str(e)}")
+            logging.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/health", dependencies=[Depends(optional_api_key)])
     async def get_status():
         """Get current system status"""
-        files = doc_manager.scan_directory()
         return {
             "status": "healthy",
             "working_directory": str(args.working_dir),
             "input_directory": str(args.input_dir),
-            "indexed_files": [str(f) for f in files],
-            "indexed_files_count": len(files),
             "configuration": {
                 # LLM configuration binding/host address (if applicable)/model (if applicable)
                 "llm_binding": args.llm_binding,
@@ -1444,26 +1762,17 @@ def create_app(args):
                 "embedding_binding_host": args.embedding_binding_host,
                 "embedding_model": args.embedding_model,
                 "max_tokens": args.max_tokens,
-                "kv_storage": rag_storage_config.KV_STORAGE,
-                "doc_status_storage": rag_storage_config.DOC_STATUS_STORAGE,
-                "graph_storage": rag_storage_config.GRAPH_STORAGE,
-                "vector_storage": rag_storage_config.VECTOR_STORAGE,
+                "kv_storage": args.kv_storage,
+                "doc_status_storage": args.doc_status_storage,
+                "graph_storage": args.graph_storage,
+                "vector_storage": args.vector_storage,
             },
         }
 
-    # webui mount /webui/index.html
-    # app.mount(
-    #     "/webui",
-    #     StaticFiles(
-    #         directory=Path(__file__).resolve().parent / "webui" / "static", html=True
-    #     ),
-    #     name="webui_static",
-    # )
-
-    # Serve the static files
-    static_dir = Path(__file__).parent / "static"
+    # Webui mount webui/index.html
+    static_dir = Path(__file__).parent / "webui"
     static_dir.mkdir(exist_ok=True)
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+    app.mount("/webui", StaticFiles(directory=static_dir, html=True), name="webui")
 
     return app
 

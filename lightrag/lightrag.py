@@ -1,150 +1,159 @@
+from __future__ import annotations
+
 import asyncio
 import os
-from tqdm.asyncio import tqdm as tqdm_async
+import configparser
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import partial
-from typing import Type, cast, Dict
+from typing import Any, AsyncIterator, Callable, Iterator, cast, final
 
-from .operate import (
-    chunking_by_token_size,
-    extract_entities,
-    # local_query,global_query,hybrid_query,
-    kg_query,
-    naive_query,
-    mix_kg_vector_query,
-    extract_keywords_only,
-    kg_query_with_keywords,
+from lightrag.kg import (
+    STORAGE_ENV_REQUIREMENTS,
+    STORAGES,
+    verify_storage_implementation,
 )
 
-from .utils import (
-    EmbeddingFunc,
-    compute_mdhash_id,
-    limit_async_func_call,
-    convert_response_to_json,
-    logger,
-    set_logger,
-    statistic_data,
-)
 from .base import (
     BaseGraphStorage,
     BaseKVStorage,
     BaseVectorStorage,
-    StorageNameSpace,
-    QueryParam,
+    DocProcessingStatus,
     DocStatus,
+    DocStatusStorage,
+    QueryParam,
+    StorageNameSpace,
+    StoragesStatus,
 )
-
 from .namespace import NameSpace, make_namespace
-
+from .operate import (
+    chunking_by_token_size,
+    extract_entities,
+    extract_keywords_only,
+    kg_query,
+    kg_query_with_keywords,
+    mix_kg_vector_query,
+    naive_query,
+)
 from .prompt import GRAPH_FIELD_SEP
+from .utils import (
+    EmbeddingFunc,
+    always_get_an_event_loop,
+    compute_mdhash_id,
+    convert_response_to_json,
+    lazy_external_import,
+    limit_async_func_call,
+    logger,
+    set_logger,
+    encode_string_by_tiktoken,
+)
+from .types import KnowledgeGraph
 
-STORAGES = {
-    "NetworkXStorage": ".kg.networkx_impl",
-    "JsonKVStorage": ".kg.json_kv_impl",
-    "NanoVectorDBStorage": ".kg.nano_vector_db_impl",
-    "JsonDocStatusStorage": ".kg.jsondocstatus_impl",
-    "Neo4JStorage": ".kg.neo4j_impl",
-    "OracleKVStorage": ".kg.oracle_impl",
-    "OracleGraphStorage": ".kg.oracle_impl",
-    "OracleVectorDBStorage": ".kg.oracle_impl",
-    "MilvusVectorDBStorge": ".kg.milvus_impl",
-    "MongoKVStorage": ".kg.mongo_impl",
-    "MongoGraphStorage": ".kg.mongo_impl",
-    "RedisKVStorage": ".kg.redis_impl",
-    "ChromaVectorDBStorage": ".kg.chroma_impl",
-    "TiDBKVStorage": ".kg.tidb_impl",
-    "TiDBVectorDBStorage": ".kg.tidb_impl",
-    "TiDBGraphStorage": ".kg.tidb_impl",
-    "PGKVStorage": ".kg.postgres_impl",
-    "PGVectorStorage": ".kg.postgres_impl",
-    "AGEStorage": ".kg.age_impl",
-    "PGGraphStorage": ".kg.postgres_impl",
-    "GremlinStorage": ".kg.gremlin_impl",
-    "PGDocStatusStorage": ".kg.postgres_impl",
-    "FaissVectorDBStorage": ".kg.faiss_impl",
-}
+# TODO: TO REMOVE @Yannick
+config = configparser.ConfigParser()
+config.read("config.ini", "utf-8")
 
 
-def lazy_external_import(module_name: str, class_name: str):
-    """Lazily import a class from an external module based on the package of the caller."""
-
-    # Get the caller's module and package
-    import inspect
-
-    caller_frame = inspect.currentframe().f_back
-    module = inspect.getmodule(caller_frame)
-    package = module.__package__ if module else None
-
-    def import_class(*args, **kwargs):
-        import importlib
-
-        module = importlib.import_module(module_name, package=package)
-        cls = getattr(module, class_name)
-        return cls(*args, **kwargs)
-
-    return import_class
-
-
-def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
-    """
-    Ensure that there is always an event loop available.
-
-    This function tries to get the current event loop. If the current event loop is closed or does not exist,
-    it creates a new event loop and sets it as the current event loop.
-
-    Returns:
-        asyncio.AbstractEventLoop: The current or newly created event loop.
-    """
-    try:
-        # Try to get the current event loop
-        current_loop = asyncio.get_event_loop()
-        if current_loop.is_closed():
-            raise RuntimeError("Event loop is closed.")
-        return current_loop
-
-    except RuntimeError:
-        # If no event loop exists or it is closed, create a new one
-        logger.info("Creating a new event loop in main thread.")
-        new_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(new_loop)
-        return new_loop
-
-
+@final
 @dataclass
 class LightRAG:
+    """LightRAG: Simple and Fast Retrieval-Augmented Generation."""
+
+    # Directory
+    # ---
+
     working_dir: str = field(
-        default_factory=lambda: f"./lightrag_cache_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}"
+        default=f"./lightrag_cache_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}"
     )
-    # Default not to use embedding cache
-    embedding_cache_config: dict = field(
-        default_factory=lambda: {
-            "enabled": False,
-            "similarity_threshold": 0.95,
-            "use_llm_check": False,
-        }
-    )
+    """Directory where cache and temporary files are stored."""
+
+    # Storage
+    # ---
+
     kv_storage: str = field(default="JsonKVStorage")
+    """Storage backend for key-value data."""
+
     vector_storage: str = field(default="NanoVectorDBStorage")
+    """Storage backend for vector embeddings."""
+
     graph_storage: str = field(default="NetworkXStorage")
+    """Storage backend for knowledge graphs."""
 
-    # logging
-    current_log_level = logger.level
-    log_level: str = field(default=current_log_level)
-    log_dir: str = field(default=os.getcwd())
+    doc_status_storage: str = field(default="JsonDocStatusStorage")
+    """Storage type for tracking document processing statuses."""
 
-    # text chunking
-    chunk_token_size: int = 1200
-    chunk_overlap_token_size: int = 100
-    tiktoken_model_name: str = "gpt-4o-mini"
+    # Logging
+    # ---
 
-    # entity extraction
-    entity_extract_max_gleaning: int = 1
-    entity_summary_to_max_tokens: int = 500
+    log_level: int = field(default=logger.level)
+    """Logging level for the system (e.g., 'DEBUG', 'INFO', 'WARNING')."""
 
-    # node embedding
-    node_embedding_algorithm: str = "node2vec"
-    node2vec_params: dict = field(
+    log_file_path: str = field(default=os.path.join(os.getcwd(), "lightrag.log"))
+    """Log file path."""
+
+    # Entity extraction
+    # ---
+
+    entity_extract_max_gleaning: int = field(default=1)
+    """Maximum number of entity extraction attempts for ambiguous content."""
+
+    entity_summary_to_max_tokens: int = field(
+        default=int(os.getenv("MAX_TOKEN_SUMMARY", 500))
+    )
+
+    # Text chunking
+    # ---
+
+    chunk_token_size: int = field(default=int(os.getenv("CHUNK_SIZE", 1200)))
+    """Maximum number of tokens per text chunk when splitting documents."""
+
+    chunk_overlap_token_size: int = field(
+        default=int(os.getenv("CHUNK_OVERLAP_SIZE", 100))
+    )
+    """Number of overlapping tokens between consecutive text chunks to preserve context."""
+
+    tiktoken_model_name: str = field(default="gpt-4o-mini")
+    """Model name used for tokenization when chunking text."""
+
+    """Maximum number of tokens used for summarizing extracted entities."""
+
+    chunking_func: Callable[
+        [
+            str,
+            str | None,
+            bool,
+            int,
+            int,
+            str,
+        ],
+        list[dict[str, Any]],
+    ] = field(default_factory=lambda: chunking_by_token_size)
+    """
+    Custom chunking function for splitting text into chunks before processing.
+
+    The function should take the following parameters:
+
+        - `content`: The text to be split into chunks.
+        - `split_by_character`: The character to split the text on. If None, the text is split into chunks of `chunk_token_size` tokens.
+        - `split_by_character_only`: If True, the text is split only on the specified character.
+        - `chunk_token_size`: The maximum number of tokens per chunk.
+        - `chunk_overlap_token_size`: The number of overlapping tokens between consecutive chunks.
+        - `tiktoken_model_name`: The name of the tiktoken model to use for tokenization.
+
+    The function should return a list of dictionaries, where each dictionary contains the following keys:
+        - `tokens`: The number of tokens in the chunk.
+        - `content`: The text content of the chunk.
+
+    Defaults to `chunking_by_token_size` if not specified.
+    """
+
+    # Node embedding
+    # ---
+
+    node_embedding_algorithm: str = field(default="node2vec")
+    """Algorithm used for node embedding in knowledge graphs."""
+
+    node2vec_params: dict[str, int] = field(
         default_factory=lambda: {
             "dimensions": 1536,
             "num_walks": 10,
@@ -154,138 +163,220 @@ class LightRAG:
             "random_seed": 3,
         }
     )
+    """Configuration for the node2vec embedding algorithm:
+    - dimensions: Number of dimensions for embeddings.
+    - num_walks: Number of random walks per node.
+    - walk_length: Number of steps per random walk.
+    - window_size: Context window size for training.
+    - iterations: Number of iterations for training.
+    - random_seed: Seed value for reproducibility.
+    """
 
-    # embedding_func: EmbeddingFunc = field(default_factory=lambda:hf_embedding)
-    embedding_func: EmbeddingFunc = None  # This must be set (we do want to separate llm from the corte, so no more default initialization)
-    embedding_batch_num: int = 32
-    embedding_func_max_async: int = 16
+    # Embedding
+    # ---
 
-    # LLM
-    llm_model_func: callable = None  # This must be set (we do want to separate llm from the corte, so no more default initialization)
-    llm_model_name: str = "meta-llama/Llama-3.2-1B-Instruct"  # 'meta-llama/Llama-3.2-1B'#'google/gemma-2-2b-it'
-    llm_model_max_token_size: int = int(os.getenv("MAX_TOKENS", "32768"))
-    llm_model_max_async: int = int(os.getenv("MAX_ASYNC", "16"))
-    llm_model_kwargs: dict = field(default_factory=dict)
+    embedding_func: EmbeddingFunc | None = field(default=None)
+    """Function for computing text embeddings. Must be set before use."""
 
-    # storage
-    vector_db_storage_cls_kwargs: dict = field(default_factory=dict)
+    embedding_batch_num: int = field(default=32)
+    """Batch size for embedding computations."""
+
+    embedding_func_max_async: int = field(default=16)
+    """Maximum number of concurrent embedding function calls."""
+
+    embedding_cache_config: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "similarity_threshold": 0.95,
+            "use_llm_check": False,
+        }
+    )
+    """Configuration for embedding cache.
+    - enabled: If True, enables caching to avoid redundant computations.
+    - similarity_threshold: Minimum similarity score to use cached embeddings.
+    - use_llm_check: If True, validates cached embeddings using an LLM.
+    """
+
+    # LLM Configuration
+    # ---
+
+    llm_model_func: Callable[..., object] | None = field(default=None)
+    """Function for interacting with the large language model (LLM). Must be set before use."""
+
+    llm_model_name: str = field(default="gpt-4o-mini")
+    """Name of the LLM model used for generating responses."""
+
+    llm_model_max_token_size: int = field(default=int(os.getenv("MAX_TOKENS", 32768)))
+    """Maximum number of tokens allowed per LLM response."""
+
+    llm_model_max_async: int = field(default=int(os.getenv("MAX_ASYNC", 16)))
+    """Maximum number of concurrent LLM calls."""
+
+    llm_model_kwargs: dict[str, Any] = field(default_factory=dict)
+    """Additional keyword arguments passed to the LLM model function."""
+
+    # Storage
+    # ---
+
+    vector_db_storage_cls_kwargs: dict[str, Any] = field(default_factory=dict)
+    """Additional parameters for vector database storage."""
+
     namespace_prefix: str = field(default="")
+    """Prefix for namespacing stored data across different environments."""
 
-    enable_llm_cache: bool = True
-    # Sometimes there are some reason the LLM failed at Extracting Entities, and we want to continue without LLM cost, we can use this flag
-    enable_llm_cache_for_entity_extract: bool = True
+    enable_llm_cache: bool = field(default=True)
+    """Enables caching for LLM responses to avoid redundant computations."""
 
-    # extension
-    addon_params: dict = field(default_factory=dict)
-    convert_response_to_json_func: callable = convert_response_to_json
+    enable_llm_cache_for_entity_extract: bool = field(default=True)
+    """If True, enables caching for entity extraction steps to reduce LLM costs."""
 
-    # Add new field for document status storage type
-    doc_status_storage: str = field(default="JsonDocStatusStorage")
+    # Extensions
+    # ---
 
-    # Custom Chunking Function
-    chunking_func: callable = chunking_by_token_size
-    chunking_func_kwargs: dict = field(default_factory=dict)
+    max_parallel_insert: int = field(default=int(os.getenv("MAX_PARALLEL_INSERT", 20)))
+    """Maximum number of parallel insert operations."""
+
+    addon_params: dict[str, Any] = field(default_factory=dict)
+
+    # Storages Management
+    # ---
+
+    auto_manage_storages_states: bool = field(default=True)
+    """If True, lightrag will automatically calls initialize_storages and finalize_storages at the appropriate times."""
+
+    # Storages Management
+    # ---
+
+    convert_response_to_json_func: Callable[[str], dict[str, Any]] = field(
+        default_factory=lambda: convert_response_to_json
+    )
+    """
+    Custom function for converting LLM responses to JSON format.
+
+    The default function is :func:`.utils.convert_response_to_json`.
+    """
+
+    cosine_better_than_threshold: float = field(
+        default=float(os.getenv("COSINE_THRESHOLD", 0.2))
+    )
+
+    _storages_status: StoragesStatus = field(default=StoragesStatus.NOT_CREATED)
 
     def __post_init__(self):
-        os.makedirs(self.log_dir, exist_ok=True)
-        log_file = os.path.join(self.log_dir, "lightrag.log")
-        set_logger(log_file)
-
         logger.setLevel(self.log_level)
+        os.makedirs(os.path.dirname(self.log_file_path), exist_ok=True)
+        set_logger(self.log_file_path)
         logger.info(f"Logger initialized for working directory: {self.working_dir}")
+
         if not os.path.exists(self.working_dir):
             logger.info(f"Creating working directory {self.working_dir}")
             os.makedirs(self.working_dir)
 
-        # show config
+        # Verify storage implementation compatibility and environment variables
+        storage_configs = [
+            ("KV_STORAGE", self.kv_storage),
+            ("VECTOR_STORAGE", self.vector_storage),
+            ("GRAPH_STORAGE", self.graph_storage),
+            ("DOC_STATUS_STORAGE", self.doc_status_storage),
+        ]
+
+        for storage_type, storage_name in storage_configs:
+            # Verify storage implementation compatibility
+            verify_storage_implementation(storage_type, storage_name)
+            # Check environment variables
+            # self.check_storage_env_vars(storage_name)
+
+        # Ensure vector_db_storage_cls_kwargs has required fields
+        self.vector_db_storage_cls_kwargs = {
+            "cosine_better_than_threshold": self.cosine_better_than_threshold,
+            **self.vector_db_storage_cls_kwargs,
+        }
+
+        # Show config
         global_config = asdict(self)
         _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
         logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
 
         # Init LLM
-        self.embedding_func = limit_async_func_call(self.embedding_func_max_async)(
+        self.embedding_func = limit_async_func_call(self.embedding_func_max_async)(  # type: ignore
             self.embedding_func
         )
 
         # Initialize all storages
-        self.key_string_value_json_storage_cls: Type[BaseKVStorage] = (
+        self.key_string_value_json_storage_cls: type[BaseKVStorage] = (
             self._get_storage_class(self.kv_storage)
-        )
-        self.vector_db_storage_cls: Type[BaseVectorStorage] = self._get_storage_class(
+        )  # type: ignore
+        self.vector_db_storage_cls: type[BaseVectorStorage] = self._get_storage_class(
             self.vector_storage
-        )
-        self.graph_storage_cls: Type[BaseGraphStorage] = self._get_storage_class(
+        )  # type: ignore
+        self.graph_storage_cls: type[BaseGraphStorage] = self._get_storage_class(
             self.graph_storage
-        )
-
-        self.key_string_value_json_storage_cls = partial(
+        )  # type: ignore
+        self.key_string_value_json_storage_cls = partial(  # type: ignore
             self.key_string_value_json_storage_cls, global_config=global_config
         )
-
-        self.vector_db_storage_cls = partial(
+        self.vector_db_storage_cls = partial(  # type: ignore
             self.vector_db_storage_cls, global_config=global_config
         )
-
-        self.graph_storage_cls = partial(
+        self.graph_storage_cls = partial(  # type: ignore
             self.graph_storage_cls, global_config=global_config
         )
 
-        self.json_doc_status_storage = self.key_string_value_json_storage_cls(
-            namespace=self.namespace_prefix + "json_doc_status_storage",
-            embedding_func=None,
-        )
+        # Initialize document status storage
+        self.doc_status_storage_cls = self._get_storage_class(self.doc_status_storage)
 
-        self.llm_response_cache = self.key_string_value_json_storage_cls(
+        self.llm_response_cache: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=make_namespace(
                 self.namespace_prefix, NameSpace.KV_STORE_LLM_RESPONSE_CACHE
             ),
             embedding_func=self.embedding_func,
         )
 
-        ####
-        # add embedding func by walter
-        ####
-        self.full_docs = self.key_string_value_json_storage_cls(
+        self.full_docs: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=make_namespace(
                 self.namespace_prefix, NameSpace.KV_STORE_FULL_DOCS
             ),
             embedding_func=self.embedding_func,
         )
-        self.text_chunks = self.key_string_value_json_storage_cls(
+        self.text_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=make_namespace(
                 self.namespace_prefix, NameSpace.KV_STORE_TEXT_CHUNKS
             ),
             embedding_func=self.embedding_func,
         )
-        self.chunk_entity_relation_graph = self.graph_storage_cls(
+        self.chunk_entity_relation_graph: BaseGraphStorage = self.graph_storage_cls(  # type: ignore
             namespace=make_namespace(
                 self.namespace_prefix, NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION
             ),
             embedding_func=self.embedding_func,
         )
-        ####
-        # add embedding func by walter over
-        ####
 
-        self.entities_vdb = self.vector_db_storage_cls(
+        self.entities_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=make_namespace(
                 self.namespace_prefix, NameSpace.VECTOR_STORE_ENTITIES
             ),
             embedding_func=self.embedding_func,
             meta_fields={"entity_name"},
         )
-        self.relationships_vdb = self.vector_db_storage_cls(
+        self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=make_namespace(
                 self.namespace_prefix, NameSpace.VECTOR_STORE_RELATIONSHIPS
             ),
             embedding_func=self.embedding_func,
             meta_fields={"src_id", "tgt_id"},
         )
-        self.chunks_vdb = self.vector_db_storage_cls(
+        self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=make_namespace(
                 self.namespace_prefix, NameSpace.VECTOR_STORE_CHUNKS
             ),
             embedding_func=self.embedding_func,
+        )
+
+        # Initialize document status storage
+        self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
+            namespace=make_namespace(self.namespace_prefix, NameSpace.DOC_STATUS),
+            global_config=global_config,
+            embedding_func=None,
         )
 
         if self.llm_response_cache and hasattr(
@@ -293,7 +384,7 @@ class LightRAG:
         ):
             hashing_kv = self.llm_response_cache
         else:
-            hashing_kv = self.key_string_value_json_storage_cls(
+            hashing_kv = self.key_string_value_json_storage_cls(  # type: ignore
                 namespace=make_namespace(
                     self.namespace_prefix, NameSpace.KV_STORE_LLM_RESPONSE_CACHE
                 ),
@@ -302,82 +393,194 @@ class LightRAG:
 
         self.llm_model_func = limit_async_func_call(self.llm_model_max_async)(
             partial(
-                self.llm_model_func,
+                self.llm_model_func,  # type: ignore
                 hashing_kv=hashing_kv,
                 **self.llm_model_kwargs,
             )
         )
 
-        # Initialize document status storage
-        self.doc_status_storage_cls = self._get_storage_class(self.doc_status_storage)
-        self.doc_status = self.doc_status_storage_cls(
-            namespace=make_namespace(self.namespace_prefix, NameSpace.DOC_STATUS),
-            global_config=global_config,
-            embedding_func=None,
-        )
+        self._storages_status = StoragesStatus.CREATED
+
+        # Initialize storages
+        if self.auto_manage_storages_states:
+            loop = always_get_an_event_loop()
+            loop.run_until_complete(self.initialize_storages())
+
+    def __del__(self):
+        # Finalize storages
+        if self.auto_manage_storages_states:
+            loop = always_get_an_event_loop()
+            loop.run_until_complete(self.finalize_storages())
+
+    async def initialize_storages(self):
+        """Asynchronously initialize the storages"""
+        if self._storages_status == StoragesStatus.CREATED:
+            tasks = []
+
+            for storage in (
+                self.full_docs,
+                self.text_chunks,
+                self.entities_vdb,
+                self.relationships_vdb,
+                self.chunks_vdb,
+                self.chunk_entity_relation_graph,
+                self.llm_response_cache,
+                self.doc_status,
+            ):
+                if storage:
+                    tasks.append(storage.initialize())
+
+            await asyncio.gather(*tasks)
+
+            self._storages_status = StoragesStatus.INITIALIZED
+            logger.debug("Initialized Storages")
+
+    async def finalize_storages(self):
+        """Asynchronously finalize the storages"""
+        if self._storages_status == StoragesStatus.INITIALIZED:
+            tasks = []
+
+            for storage in (
+                self.full_docs,
+                self.text_chunks,
+                self.entities_vdb,
+                self.relationships_vdb,
+                self.chunks_vdb,
+                self.chunk_entity_relation_graph,
+                self.llm_response_cache,
+                self.doc_status,
+            ):
+                if storage:
+                    tasks.append(storage.finalize())
+
+            await asyncio.gather(*tasks)
+
+            self._storages_status = StoragesStatus.FINALIZED
+            logger.debug("Finalized Storages")
 
     async def get_graph_labels(self):
         text = await self.chunk_entity_relation_graph.get_all_labels()
         return text
 
-    async def get_graps(self, nodel_label: str, max_depth: int):
+    async def get_knowledge_graph(
+        self, nodel_label: str, max_depth: int
+    ) -> KnowledgeGraph:
         return await self.chunk_entity_relation_graph.get_knowledge_graph(
             node_label=nodel_label, max_depth=max_depth
         )
 
-    def _get_storage_class(self, storage_name: str) -> dict:
+    def _get_storage_class(self, storage_name: str) -> Callable[..., Any]:
         import_path = STORAGES[storage_name]
         storage_class = lazy_external_import(import_path, storage_name)
         return storage_class
 
-    def set_storage_client(self, db_client):
-        # Now only tested on Oracle Database
-        for storage in [
-            self.vector_db_storage_cls,
-            self.graph_storage_cls,
-            self.doc_status,
-            self.full_docs,
-            self.text_chunks,
-            self.llm_response_cache,
-            self.key_string_value_json_storage_cls,
-            self.chunks_vdb,
-            self.relationships_vdb,
-            self.entities_vdb,
-            self.graph_storage_cls,
-            self.chunk_entity_relation_graph,
-            self.llm_response_cache,
-        ]:
-            # set client
-            storage.db = db_client
-
     def insert(
-        self, string_or_strings, split_by_character=None, split_by_character_only=False
-    ):
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(
-            self.ainsert(string_or_strings, split_by_character, split_by_character_only)
-        )
-
-    async def ainsert(
-        self, string_or_strings, split_by_character=None, split_by_character_only=False
-    ):
-        """Insert documents with checkpoint support
+        self,
+        input: str | list[str],
+        split_by_character: str | None = None,
+        split_by_character_only: bool = False,
+    ) -> None:
+        """Sync Insert documents with checkpoint support
 
         Args:
-            string_or_strings: Single document string or list of document strings
+            input: Single document string or list of document strings
             split_by_character: if split_by_character is not None, split the string by character, if chunk longer than
-            chunk_size, split the sub chunk by token size.
             split_by_character_only: if split_by_character_only is True, split the string by character only, when
             split_by_character is None, this parameter is ignored.
         """
-        if isinstance(string_or_strings, str):
-            string_or_strings = [string_or_strings]
+        loop = always_get_an_event_loop()
+        loop.run_until_complete(
+            self.ainsert(input, split_by_character, split_by_character_only)
+        )
+
+    async def ainsert(
+        self,
+        input: str | list[str],
+        split_by_character: str | None = None,
+        split_by_character_only: bool = False,
+    ) -> None:
+        """Async Insert documents with checkpoint support
+
+        Args:
+            input: Single document string or list of document strings
+            split_by_character: if split_by_character is not None, split the string by character, if chunk longer than
+            split_by_character_only: if split_by_character_only is True, split the string by character only, when
+            split_by_character is None, this parameter is ignored.
+        """
+        await self.apipeline_enqueue_documents(input)
+        await self.apipeline_process_enqueue_documents(
+            split_by_character, split_by_character_only
+        )
+
+    def insert_custom_chunks(self, full_text: str, text_chunks: list[str]) -> None:
+        loop = always_get_an_event_loop()
+        loop.run_until_complete(self.ainsert_custom_chunks(full_text, text_chunks))
+
+    async def ainsert_custom_chunks(
+        self, full_text: str, text_chunks: list[str]
+    ) -> None:
+        update_storage = False
+        try:
+            doc_key = compute_mdhash_id(full_text.strip(), prefix="doc-")
+            new_docs = {doc_key: {"content": full_text.strip()}}
+
+            _add_doc_keys = await self.full_docs.filter_keys(set(doc_key))
+            new_docs = {k: v for k, v in new_docs.items() if k in _add_doc_keys}
+            if not len(new_docs):
+                logger.warning("This document is already in the storage.")
+                return
+
+            update_storage = True
+            logger.info(f"Inserting {len(new_docs)} docs")
+
+            inserting_chunks: dict[str, Any] = {}
+            for chunk_text in text_chunks:
+                chunk_text_stripped = chunk_text.strip()
+                chunk_key = compute_mdhash_id(chunk_text_stripped, prefix="chunk-")
+
+                inserting_chunks[chunk_key] = {
+                    "content": chunk_text_stripped,
+                    "full_doc_id": doc_key,
+                }
+
+            doc_ids = set(inserting_chunks.keys())
+            add_chunk_keys = await self.text_chunks.filter_keys(doc_ids)
+            inserting_chunks = {
+                k: v for k, v in inserting_chunks.items() if k in add_chunk_keys
+            }
+            if not len(inserting_chunks):
+                logger.warning("All chunks are already in the storage.")
+                return
+
+            tasks = [
+                self.chunks_vdb.upsert(inserting_chunks),
+                self._process_entity_relation_graph(inserting_chunks),
+                self.full_docs.upsert(new_docs),
+                self.text_chunks.upsert(inserting_chunks),
+            ]
+            await asyncio.gather(*tasks)
+
+        finally:
+            if update_storage:
+                await self._insert_done()
+
+    async def apipeline_enqueue_documents(self, input: str | list[str]) -> None:
+        """
+        Pipeline for Processing Documents
+
+        1. Remove duplicate contents from the list
+        2. Generate document IDs and initial status
+        3. Filter out already processed documents
+        4. Enqueue document in status
+        """
+        if isinstance(input, str):
+            input = [input]
 
         # 1. Remove duplicate contents from the list
-        unique_contents = list(set(doc.strip() for doc in string_or_strings))
+        unique_contents = list(set(doc.strip() for doc in input))
 
         # 2. Generate document IDs and initial status
-        new_docs = {
+        new_docs: dict[str, Any] = {
             compute_mdhash_id(content, prefix="doc-"): {
                 "content": content,
                 "content_summary": self._get_content_summary(content),
@@ -390,434 +593,225 @@ class LightRAG:
         }
 
         # 3. Filter out already processed documents
-        # _add_doc_keys = await self.doc_status.filter_keys(list(new_docs.keys()))
-        _add_doc_keys = set()
-        for doc_id in new_docs.keys():
-            current_doc = await self.doc_status.get_by_id(doc_id)
-
-            if current_doc is None:
-                _add_doc_keys.add(doc_id)
-                continue  # skip to the next doc_id
-
-            status = None
-            if isinstance(current_doc, dict):
-                status = current_doc["status"]
-            else:
-                status = current_doc.status
-
-            if status == DocStatus.FAILED:
-                _add_doc_keys.add(doc_id)
-
-        new_docs = {k: v for k, v in new_docs.items() if k in _add_doc_keys}
+        # Get docs ids
+        all_new_doc_ids = set(new_docs.keys())
+        # Exclude IDs of documents that are already in progress
+        unique_new_doc_ids = await self.doc_status.filter_keys(all_new_doc_ids)
+        # Filter new_docs to only include documents with unique IDs
+        new_docs = {doc_id: new_docs[doc_id] for doc_id in unique_new_doc_ids}
 
         if not new_docs:
+            logger.info("No new unique documents were found.")
+            return
+
+        # 4. Store status document
+        await self.doc_status.upsert(new_docs)
+        logger.info(f"Stored {len(new_docs)} new unique documents")
+
+    async def apipeline_process_enqueue_documents(
+        self,
+        split_by_character: str | None = None,
+        split_by_character_only: bool = False,
+    ) -> None:
+        """
+        Process pending documents by splitting them into chunks, processing
+        each chunk for entity and relation extraction, and updating the
+        document status.
+
+        1. Get all pending, failed, and abnormally terminated processing documents.
+        2. Split document content into chunks
+        3. Process each chunk for entity and relation extraction
+        4. Update the document status
+        """
+        # 1. Get all pending, failed, and abnormally terminated processing documents.
+        # Run the asynchronous status retrievals in parallel using asyncio.gather
+        processing_docs, failed_docs, pending_docs = await asyncio.gather(
+            self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
+            self.doc_status.get_docs_by_status(DocStatus.FAILED),
+            self.doc_status.get_docs_by_status(DocStatus.PENDING),
+        )
+
+        to_process_docs: dict[str, DocProcessingStatus] = {}
+        to_process_docs.update(processing_docs)
+        to_process_docs.update(failed_docs)
+        to_process_docs.update(pending_docs)
+
+        if not to_process_docs:
             logger.info("All documents have been processed or are duplicates")
             return
 
-        logger.info(f"Processing {len(new_docs)} new unique documents")
+        # 2. split docs into chunks, insert chunks, update doc status
+        docs_batches = [
+            list(to_process_docs.items())[i : i + self.max_parallel_insert]
+            for i in range(0, len(to_process_docs), self.max_parallel_insert)
+        ]
 
-        # Process documents in batches
-        batch_size = self.addon_params.get("insert_batch_size", 10)
-        for i in range(0, len(new_docs), batch_size):
-            batch_docs = dict(list(new_docs.items())[i : i + batch_size])
+        logger.info(f"Number of batches to process: {len(docs_batches)}.")
 
-            for doc_id, doc in tqdm_async(
-                batch_docs.items(), desc=f"Processing batch {i // batch_size + 1}"
-            ):
-                try:
-                    # Update status to processing
-                    doc_status = {
-                        "content_summary": doc["content_summary"],
-                        "content_length": doc["content_length"],
-                        "status": DocStatus.PROCESSING,
-                        "created_at": doc["created_at"],
-                        "updated_at": datetime.now().isoformat(),
-                    }
-                    await self.doc_status.upsert({doc_id: doc_status})
+        batches: list[Any] = []
+        # 3. iterate over batches
+        for batch_idx, docs_batch in enumerate(docs_batches):
 
+            async def batch(
+                batch_idx: int,
+                docs_batch: list[tuple[str, DocProcessingStatus]],
+                size_batch: int,
+            ) -> None:
+                logger.info(f"Start processing batch {batch_idx + 1} of {size_batch}.")
+                # 4. iterate over batch
+                for doc_id_processing_status in docs_batch:
+                    doc_id, status_doc = doc_id_processing_status
+                    # Update status in processing
+                    doc_status_id = compute_mdhash_id(status_doc.content, prefix="doc-")
                     # Generate chunks from document
-                    chunks = {
+                    chunks: dict[str, Any] = {
                         compute_mdhash_id(dp["content"], prefix="chunk-"): {
                             **dp,
                             "full_doc_id": doc_id,
                         }
                         for dp in self.chunking_func(
-                            doc["content"],
-                            split_by_character=split_by_character,
-                            split_by_character_only=split_by_character_only,
-                            overlap_token_size=self.chunk_overlap_token_size,
-                            max_token_size=self.chunk_token_size,
-                            tiktoken_model=self.tiktoken_model_name,
-                            **self.chunking_func_kwargs,
+                            status_doc.content,
+                            split_by_character,
+                            split_by_character_only,
+                            self.chunk_overlap_token_size,
+                            self.chunk_token_size,
+                            self.tiktoken_model_name,
                         )
                     }
-
-                    # Update status with chunks information
-                    doc_status.update(
-                        {
-                            "chunks_count": len(chunks),
-                            "updated_at": datetime.now().isoformat(),
-                        }
-                    )
-                    await self.doc_status.upsert({doc_id: doc_status})
-
+                    # Process document (text chunks and full docs) in parallel
+                    tasks = [
+                        self.doc_status.upsert(
+                            {
+                                doc_status_id: {
+                                    "status": DocStatus.PROCESSING,
+                                    "updated_at": datetime.now().isoformat(),
+                                    "content": status_doc.content,
+                                    "content_summary": status_doc.content_summary,
+                                    "content_length": status_doc.content_length,
+                                    "created_at": status_doc.created_at,
+                                }
+                            }
+                        ),
+                        self.chunks_vdb.upsert(chunks),
+                        self._process_entity_relation_graph(chunks),
+                        self.full_docs.upsert(
+                            {doc_id: {"content": status_doc.content}}
+                        ),
+                        self.text_chunks.upsert(chunks),
+                    ]
                     try:
-                        # Store chunks in vector database
-                        await self.chunks_vdb.upsert(chunks)
-
-                        # Extract and store entities and relationships
-                        maybe_new_kg = await extract_entities(
-                            chunks,
-                            knowledge_graph_inst=self.chunk_entity_relation_graph,
-                            entity_vdb=self.entities_vdb,
-                            relationships_vdb=self.relationships_vdb,
-                            llm_response_cache=self.llm_response_cache,
-                            global_config=asdict(self),
-                        )
-
-                        if maybe_new_kg is None:
-                            raise Exception(
-                                "Failed to extract entities and relationships"
-                            )
-
-                        self.chunk_entity_relation_graph = maybe_new_kg
-
-                        # Store original document and chunks
-                        await self.full_docs.upsert(
-                            {doc_id: {"content": doc["content"]}}
-                        )
-                        await self.text_chunks.upsert(chunks)
-
-                        # Update status to processed
-                        doc_status.update(
+                        await asyncio.gather(*tasks)
+                        await self.doc_status.upsert(
                             {
-                                "status": DocStatus.PROCESSED,
-                                "updated_at": datetime.now().isoformat(),
+                                doc_status_id: {
+                                    "status": DocStatus.PROCESSED,
+                                    "chunks_count": len(chunks),
+                                    "content": status_doc.content,
+                                    "content_summary": status_doc.content_summary,
+                                    "content_length": status_doc.content_length,
+                                    "created_at": status_doc.created_at,
+                                    "updated_at": datetime.now().isoformat(),
+                                }
                             }
                         )
-                        await self.doc_status.upsert({doc_id: doc_status})
-
                     except Exception as e:
-                        # Mark as failed if any step fails
-                        doc_status.update(
+                        logger.error(f"Failed to process document {doc_id}: {str(e)}")
+                        await self.doc_status.upsert(
                             {
-                                "status": DocStatus.FAILED,
-                                "error": str(e),
-                                "updated_at": datetime.now().isoformat(),
+                                doc_status_id: {
+                                    "status": DocStatus.FAILED,
+                                    "error": str(e),
+                                    "content": status_doc.content,
+                                    "content_summary": status_doc.content_summary,
+                                    "content_length": status_doc.content_length,
+                                    "created_at": status_doc.created_at,
+                                    "updated_at": datetime.now().isoformat(),
+                                }
                             }
                         )
-                        await self.doc_status.upsert({doc_id: doc_status})
-                        raise e
+                        continue
+                logger.info(f"Completed batch {batch_idx + 1} of {len(docs_batches)}.")
 
-                except Exception as e:
-                    import traceback
+            batches.append(batch(batch_idx, docs_batch, len(docs_batches)))
 
-                    error_msg = f"Failed to process document {doc_id}: {str(e)}\n{traceback.format_exc()}"
-                    logger.error(error_msg)
-                    continue
-                else:
-                    # Only update index when processing succeeds
-                    await self._insert_done()
+        await asyncio.gather(*batches)
+        await self._insert_done()
 
-    def insert_custom_chunks(self, full_text: str, text_chunks: list[str]):
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(
-            self.ainsert_custom_chunks(full_text, text_chunks)
-        )
-
-    async def ainsert_custom_chunks(self, full_text: str, text_chunks: list[str]):
-        update_storage = False
+    async def _process_entity_relation_graph(self, chunk: dict[str, Any]) -> None:
         try:
-            doc_key = compute_mdhash_id(full_text.strip(), prefix="doc-")
-            new_docs = {doc_key: {"content": full_text.strip()}}
-
-            _add_doc_keys = await self.full_docs.filter_keys([doc_key])
-            new_docs = {k: v for k, v in new_docs.items() if k in _add_doc_keys}
-            if not len(new_docs):
-                logger.warning("This document is already in the storage.")
-                return
-
-            update_storage = True
-            logger.info(f"[New Docs] inserting {len(new_docs)} docs")
-
-            inserting_chunks = {}
-            for chunk_text in text_chunks:
-                chunk_text_stripped = chunk_text.strip()
-                chunk_key = compute_mdhash_id(chunk_text_stripped, prefix="chunk-")
-
-                inserting_chunks[chunk_key] = {
-                    "content": chunk_text_stripped,
-                    "full_doc_id": doc_key,
-                }
-
-            _add_chunk_keys = await self.text_chunks.filter_keys(
-                list(inserting_chunks.keys())
-            )
-            inserting_chunks = {
-                k: v for k, v in inserting_chunks.items() if k in _add_chunk_keys
-            }
-            if not len(inserting_chunks):
-                logger.warning("All chunks are already in the storage.")
-                return
-
-            logger.info(f"[New Chunks] inserting {len(inserting_chunks)} chunks")
-
-            await self.chunks_vdb.upsert(inserting_chunks)
-
-            logger.info("[Entity Extraction]...")
-            maybe_new_kg = await extract_entities(
-                inserting_chunks,
+            await extract_entities(
+                chunk,
                 knowledge_graph_inst=self.chunk_entity_relation_graph,
                 entity_vdb=self.entities_vdb,
                 relationships_vdb=self.relationships_vdb,
+                llm_response_cache=self.llm_response_cache,
                 global_config=asdict(self),
             )
+        except Exception as e:
+            logger.error("Failed to extract entities and relationships")
+            raise e
 
-            if maybe_new_kg is None:
-                logger.warning("No new entities and relationships found")
-                return
-            else:
-                self.chunk_entity_relation_graph = maybe_new_kg
-
-            await self.full_docs.upsert(new_docs)
-            await self.text_chunks.upsert(inserting_chunks)
-
-        finally:
-            if update_storage:
-                await self._insert_done()
-
-    async def apipeline_process_documents(self, string_or_strings):
-        """Input list remove duplicates, generate document IDs and initial pendding status, filter out already stored documents, store docs
-        Args:
-            string_or_strings: Single document string or list of document strings
-        """
-        if isinstance(string_or_strings, str):
-            string_or_strings = [string_or_strings]
-
-        # 1. Remove duplicate contents from the list
-        unique_contents = list(set(doc.strip() for doc in string_or_strings))
-
-        logger.info(
-            f"Received {len(string_or_strings)} docs, contains {len(unique_contents)} new unique documents"
-        )
-
-        # 2. Generate document IDs and initial status
-        new_docs = {
-            compute_mdhash_id(content, prefix="doc-"): {
-                "content": content,
-                "content_summary": self._get_content_summary(content),
-                "content_length": len(content),
-                "status": DocStatus.PENDING,
-                "created_at": datetime.now().isoformat(),
-                "updated_at": None,
-            }
-            for content in unique_contents
-        }
-
-        # 3. Filter out already processed documents
-        _not_stored_doc_keys = await self.full_docs.filter_keys(list(new_docs.keys()))
-        if len(_not_stored_doc_keys) < len(new_docs):
-            logger.info(
-                f"Skipping {len(new_docs) - len(_not_stored_doc_keys)} already existing documents"
-            )
-        new_docs = {k: v for k, v in new_docs.items() if k in _not_stored_doc_keys}
-
-        if not new_docs:
-            logger.info("All documents have been processed or are duplicates")
-            return None
-
-        # 4. Store original document
-        for doc_id, doc in new_docs.items():
-            await self.full_docs.upsert({doc_id: {"content": doc["content"]}})
-            await self.full_docs.change_status(doc_id, DocStatus.PENDING)
-        logger.info(f"Stored {len(new_docs)} new unique documents")
-
-    async def apipeline_process_chunks(self):
-        """Get pendding documents, split into chunks,insert chunks"""
-        # 1. get all pending and failed documents
-        _todo_doc_keys = []
-        _failed_doc = await self.full_docs.get_by_status_and_ids(
-            status=DocStatus.FAILED, ids=None
-        )
-        _pendding_doc = await self.full_docs.get_by_status_and_ids(
-            status=DocStatus.PENDING, ids=None
-        )
-        if _failed_doc:
-            _todo_doc_keys.extend([doc["id"] for doc in _failed_doc])
-        if _pendding_doc:
-            _todo_doc_keys.extend([doc["id"] for doc in _pendding_doc])
-        if not _todo_doc_keys:
-            logger.info("All documents have been processed or are duplicates")
-            return None
-        else:
-            logger.info(f"Filtered out {len(_todo_doc_keys)} not processed documents")
-
-        new_docs = {
-            doc["id"]: doc for doc in await self.full_docs.get_by_ids(_todo_doc_keys)
-        }
-
-        # 2. split docs into chunks, insert chunks, update doc status
-        chunk_cnt = 0
-        batch_size = self.addon_params.get("insert_batch_size", 10)
-        for i in range(0, len(new_docs), batch_size):
-            batch_docs = dict(list(new_docs.items())[i : i + batch_size])
-            for doc_id, doc in tqdm_async(
-                batch_docs.items(),
-                desc=f"Level 1 - Spliting doc in batch {i // batch_size + 1}",
-            ):
-                try:
-                    # Generate chunks from document
-                    chunks = {
-                        compute_mdhash_id(dp["content"], prefix="chunk-"): {
-                            **dp,
-                            "full_doc_id": doc_id,
-                            "status": DocStatus.PENDING,
-                        }
-                        for dp in chunking_by_token_size(
-                            doc["content"],
-                            overlap_token_size=self.chunk_overlap_token_size,
-                            max_token_size=self.chunk_token_size,
-                            tiktoken_model=self.tiktoken_model_name,
-                        )
-                    }
-                    chunk_cnt += len(chunks)
-                    await self.text_chunks.upsert(chunks)
-                    await self.text_chunks.change_status(doc_id, DocStatus.PROCESSING)
-
-                    try:
-                        # Store chunks in vector database
-                        await self.chunks_vdb.upsert(chunks)
-                        # Update doc status
-                        await self.full_docs.change_status(doc_id, DocStatus.PROCESSED)
-                    except Exception as e:
-                        # Mark as failed if any step fails
-                        await self.full_docs.change_status(doc_id, DocStatus.FAILED)
-                        raise e
-                except Exception as e:
-                    import traceback
-
-                    error_msg = f"Failed to process document {doc_id}: {str(e)}\n{traceback.format_exc()}"
-                    logger.error(error_msg)
-                    continue
-        logger.info(f"Stored {chunk_cnt} chunks from {len(new_docs)} documents")
-
-    async def apipeline_process_extract_graph(self):
-        """Get pendding or failed chunks, extract entities and relationships from each chunk"""
-        # 1. get all pending and failed chunks
-        _todo_chunk_keys = []
-        _failed_chunks = await self.text_chunks.get_by_status_and_ids(
-            status=DocStatus.FAILED, ids=None
-        )
-        _pendding_chunks = await self.text_chunks.get_by_status_and_ids(
-            status=DocStatus.PENDING, ids=None
-        )
-        if _failed_chunks:
-            _todo_chunk_keys.extend([doc["id"] for doc in _failed_chunks])
-        if _pendding_chunks:
-            _todo_chunk_keys.extend([doc["id"] for doc in _pendding_chunks])
-        if not _todo_chunk_keys:
-            logger.info("All chunks have been processed or are duplicates")
-            return None
-
-        # Process documents in batches
-        batch_size = self.addon_params.get("insert_batch_size", 10)
-
-        semaphore = asyncio.Semaphore(
-            batch_size
-        )  # Control the number of tasks that are processed simultaneously
-
-        async def process_chunk(chunk_id):
-            async with semaphore:
-                chunks = {
-                    i["id"]: i for i in await self.text_chunks.get_by_ids([chunk_id])
-                }
-                # Extract and store entities and relationships
-                try:
-                    maybe_new_kg = await extract_entities(
-                        chunks,
-                        knowledge_graph_inst=self.chunk_entity_relation_graph,
-                        entity_vdb=self.entities_vdb,
-                        relationships_vdb=self.relationships_vdb,
-                        llm_response_cache=self.llm_response_cache,
-                        global_config=asdict(self),
-                    )
-                    if maybe_new_kg is None:
-                        logger.info("No entities or relationships extracted!")
-                    # Update status to processed
-                    await self.text_chunks.change_status(chunk_id, DocStatus.PROCESSED)
-                except Exception as e:
-                    logger.error("Failed to extract entities and relationships")
-                    # Mark as failed if any step fails
-                    await self.text_chunks.change_status(chunk_id, DocStatus.FAILED)
-                    raise e
-
-        with tqdm_async(
-            total=len(_todo_chunk_keys),
-            desc="\nLevel 1 - Processing chunks",
-            unit="chunk",
-            position=0,
-        ) as progress:
-            tasks = []
-            for chunk_id in _todo_chunk_keys:
-                task = asyncio.create_task(process_chunk(chunk_id))
-                tasks.append(task)
-
-            for future in asyncio.as_completed(tasks):
-                await future
-                progress.update(1)
-                progress.set_postfix(
-                    {
-                        "LLM call": statistic_data["llm_call"],
-                        "LLM cache": statistic_data["llm_cache"],
-                    }
-                )
-
-        # Ensure all indexes are updated after each document
-        await self._insert_done()
-
-    async def _insert_done(self):
-        tasks = []
-        for storage_inst in [
-            self.full_docs,
-            self.text_chunks,
-            self.llm_response_cache,
-            self.entities_vdb,
-            self.relationships_vdb,
-            self.chunks_vdb,
-            self.chunk_entity_relation_graph,
-        ]:
-            if storage_inst is None:
-                continue
-            tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
+    async def _insert_done(self) -> None:
+        tasks = [
+            cast(StorageNameSpace, storage_inst).index_done_callback()
+            for storage_inst in [  # type: ignore
+                self.full_docs,
+                self.text_chunks,
+                self.llm_response_cache,
+                self.entities_vdb,
+                self.relationships_vdb,
+                self.chunks_vdb,
+                self.chunk_entity_relation_graph,
+            ]
+            if storage_inst is not None
+        ]
         await asyncio.gather(*tasks)
+        logger.info("All Insert done")
 
-    def insert_custom_kg(self, custom_kg: dict):
+    def insert_custom_kg(self, custom_kg: dict[str, Any]) -> None:
         loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.ainsert_custom_kg(custom_kg))
+        loop.run_until_complete(self.ainsert_custom_kg(custom_kg))
 
-    async def ainsert_custom_kg(self, custom_kg: dict):
+    async def ainsert_custom_kg(self, custom_kg: dict[str, Any]) -> None:
         update_storage = False
         try:
             # Insert chunks into vector storage
-            all_chunks_data = {}
-            chunk_to_source_map = {}
-            for chunk_data in custom_kg.get("chunks", []):
-                chunk_content = chunk_data["content"]
+            all_chunks_data: dict[str, dict[str, str]] = {}
+            chunk_to_source_map: dict[str, str] = {}
+            for chunk_data in custom_kg.get("chunks", {}):
+                chunk_content = chunk_data["content"].strip()
                 source_id = chunk_data["source_id"]
-                chunk_id = compute_mdhash_id(chunk_content.strip(), prefix="chunk-")
+                tokens = len(
+                    encode_string_by_tiktoken(
+                        chunk_content, model_name=self.tiktoken_model_name
+                    )
+                )
+                chunk_order_index = (
+                    0
+                    if "chunk_order_index" not in chunk_data.keys()
+                    else chunk_data["chunk_order_index"]
+                )
+                chunk_id = compute_mdhash_id(chunk_content, prefix="chunk-")
 
-                chunk_entry = {"content": chunk_content.strip(), "source_id": source_id}
+                chunk_entry = {
+                    "content": chunk_content,
+                    "source_id": source_id,
+                    "tokens": tokens,
+                    "chunk_order_index": chunk_order_index,
+                    "full_doc_id": source_id,
+                    "status": DocStatus.PROCESSED,
+                }
                 all_chunks_data[chunk_id] = chunk_entry
                 chunk_to_source_map[source_id] = chunk_id
                 update_storage = True
 
-            if self.chunks_vdb is not None and all_chunks_data:
+            if all_chunks_data:
                 await self.chunks_vdb.upsert(all_chunks_data)
-            if self.text_chunks is not None and all_chunks_data:
+            if all_chunks_data:
                 await self.text_chunks.upsert(all_chunks_data)
 
             # Insert entities into knowledge graph
-            all_entities_data = []
+            all_entities_data: list[dict[str, str]] = []
             for entity_data in custom_kg.get("entities", []):
                 entity_name = f'"{entity_data["entity_name"].upper()}"'
                 entity_type = entity_data.get("entity_type", "UNKNOWN")
@@ -833,7 +827,7 @@ class LightRAG:
                     )
 
                 # Prepare node data
-                node_data = {
+                node_data: dict[str, str] = {
                     "entity_type": entity_type,
                     "description": description,
                     "source_id": source_id,
@@ -847,7 +841,7 @@ class LightRAG:
                 update_storage = True
 
             # Insert relationships into knowledge graph
-            all_relationships_data = []
+            all_relationships_data: list[dict[str, str]] = []
             for relationship_data in custom_kg.get("relationships", []):
                 src_id = f'"{relationship_data["src_id"].upper()}"'
                 tgt_id = f'"{relationship_data["tgt_id"].upper()}"'
@@ -889,7 +883,7 @@ class LightRAG:
                         "source_id": source_id,
                     },
                 )
-                edge_data = {
+                edge_data: dict[str, str] = {
                     "src_id": src_id,
                     "tgt_id": tgt_id,
                     "description": description,
@@ -899,41 +893,71 @@ class LightRAG:
                 update_storage = True
 
             # Insert entities into vector storage if needed
-            if self.entities_vdb is not None:
-                data_for_vdb = {
-                    compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
-                        "content": dp["entity_name"] + dp["description"],
-                        "entity_name": dp["entity_name"],
-                    }
-                    for dp in all_entities_data
+            data_for_vdb = {
+                compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
+                    "content": dp["entity_name"] + dp["description"],
+                    "entity_name": dp["entity_name"],
                 }
-                await self.entities_vdb.upsert(data_for_vdb)
+                for dp in all_entities_data
+            }
+            await self.entities_vdb.upsert(data_for_vdb)
 
             # Insert relationships into vector storage if needed
-            if self.relationships_vdb is not None:
-                data_for_vdb = {
-                    compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
-                        "src_id": dp["src_id"],
-                        "tgt_id": dp["tgt_id"],
-                        "content": dp["keywords"]
-                        + dp["src_id"]
-                        + dp["tgt_id"]
-                        + dp["description"],
-                    }
-                    for dp in all_relationships_data
+            data_for_vdb = {
+                compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
+                    "src_id": dp["src_id"],
+                    "tgt_id": dp["tgt_id"],
+                    "content": dp["keywords"]
+                    + dp["src_id"]
+                    + dp["tgt_id"]
+                    + dp["description"],
                 }
-                await self.relationships_vdb.upsert(data_for_vdb)
+                for dp in all_relationships_data
+            }
+            await self.relationships_vdb.upsert(data_for_vdb)
+
         finally:
             if update_storage:
                 await self._insert_done()
 
-    def query(self, query: str, prompt: str = "", param: QueryParam = QueryParam()):
+    def query(
+        self,
+        query: str,
+        param: QueryParam = QueryParam(),
+        system_prompt: str | None = None,
+    ) -> str | Iterator[str]:
+        """
+        Perform a sync query.
+
+        Args:
+            query (str): The query to be executed.
+            param (QueryParam): Configuration parameters for query execution.
+            prompt (Optional[str]): Custom prompts for fine-tuned control over the system's behavior. Defaults to None, which uses PROMPTS["rag_response"].
+
+        Returns:
+            str: The result of the query execution.
+        """
         loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.aquery(query, prompt, param))
+
+        return loop.run_until_complete(self.aquery(query, param, system_prompt))  # type: ignore
 
     async def aquery(
-        self, query: str, prompt: str = "", param: QueryParam = QueryParam()
-    ):
+        self,
+        query: str,
+        param: QueryParam = QueryParam(),
+        system_prompt: str | None = None,
+    ) -> str | AsyncIterator[str]:
+        """
+        Perform a async query.
+
+        Args:
+            query (str): The query to be executed.
+            param (QueryParam): Configuration parameters for query execution.
+            prompt (Optional[str]): Custom prompts for fine-tuned control over the system's behavior. Defaults to None, which uses PROMPTS["rag_response"].
+
+        Returns:
+            str: The result of the query execution.
+        """
         if param.mode in ["local", "global", "hybrid"]:
             response = await kg_query(
                 query,
@@ -953,7 +977,7 @@ class LightRAG:
                     global_config=asdict(self),
                     embedding_func=self.embedding_func,
                 ),
-                prompt=prompt,
+                system_prompt=system_prompt,
             )
         elif param.mode == "naive":
             response = await naive_query(
@@ -972,6 +996,7 @@ class LightRAG:
                     global_config=asdict(self),
                     embedding_func=self.embedding_func,
                 ),
+                system_prompt=system_prompt,
             )
         elif param.mode == "mix":
             response = await mix_kg_vector_query(
@@ -993,6 +1018,7 @@ class LightRAG:
                     global_config=asdict(self),
                     embedding_func=self.embedding_func,
                 ),
+                system_prompt=system_prompt,
             )
         else:
             raise ValueError(f"Unknown mode {param.mode}")
@@ -1006,7 +1032,6 @@ class LightRAG:
         1. Extract keywords from the 'query' using new function in operate.py.
         2. Then run the standard aquery() flow with the final prompt (formatted_question).
         """
-
         loop = always_get_an_event_loop()
         return loop.run_until_complete(
             self.aquery_with_separate_keyword_extraction(query, prompt, param)
@@ -1014,16 +1039,14 @@ class LightRAG:
 
     async def aquery_with_separate_keyword_extraction(
         self, query: str, prompt: str, param: QueryParam = QueryParam()
-    ):
+    ) -> str | AsyncIterator[str]:
         """
         1. Calls extract_keywords_only to get HL/LL keywords from 'query'.
         2. Then calls kg_query(...) or naive_query(...), etc. as the main query, while also injecting the newly extracted keywords if needed.
         """
-
         # ---------------------
         # STEP 1: Keyword Extraction
         # ---------------------
-        # We'll assume 'extract_keywords_only(...)' returns (hl_keywords, ll_keywords).
         hl_keywords, ll_keywords = await extract_keywords_only(
             text=query,
             param=param,
@@ -1038,8 +1061,8 @@ class LightRAG:
             ),
         )
 
-        param.hl_keywords = (hl_keywords,)
-        param.ll_keywords = (ll_keywords,)
+        param.hl_keywords = hl_keywords
+        param.ll_keywords = ll_keywords
 
         # ---------------------
         # STEP 2: Final Query Logic
@@ -1067,7 +1090,7 @@ class LightRAG:
                         self.namespace_prefix, NameSpace.KV_STORE_LLM_RESPONSE_CACHE
                     ),
                     global_config=asdict(self),
-                    embedding_func=self.embedding_funcne,
+                    embedding_func=self.embedding_func,
                 ),
             )
         elif param.mode == "naive":
@@ -1116,18 +1139,13 @@ class LightRAG:
         return response
 
     async def _query_done(self):
-        tasks = []
-        for storage_inst in [self.llm_response_cache]:
-            if storage_inst is None:
-                continue
-            tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
-        await asyncio.gather(*tasks)
+        await self.llm_response_cache.index_done_callback()
 
-    def delete_by_entity(self, entity_name: str):
+    def delete_by_entity(self, entity_name: str) -> None:
         loop = always_get_an_event_loop()
         return loop.run_until_complete(self.adelete_by_entity(entity_name))
 
-    async def adelete_by_entity(self, entity_name: str):
+    async def adelete_by_entity(self, entity_name: str) -> None:
         entity_name = f'"{entity_name.upper()}"'
 
         try:
@@ -1142,17 +1160,17 @@ class LightRAG:
         except Exception as e:
             logger.error(f"Error while deleting entity '{entity_name}': {e}")
 
-    async def _delete_by_entity_done(self):
-        tasks = []
-        for storage_inst in [
-            self.entities_vdb,
-            self.relationships_vdb,
-            self.chunk_entity_relation_graph,
-        ]:
-            if storage_inst is None:
-                continue
-            tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
-        await asyncio.gather(*tasks)
+    async def _delete_by_entity_done(self) -> None:
+        await asyncio.gather(
+            *[
+                cast(StorageNameSpace, storage_inst).index_done_callback()
+                for storage_inst in [  # type: ignore
+                    self.entities_vdb,
+                    self.relationships_vdb,
+                    self.chunk_entity_relation_graph,
+                ]
+            ]
+        )
 
     def _get_content_summary(self, content: str, max_length: int = 100) -> str:
         """Get summary of document content
@@ -1169,7 +1187,7 @@ class LightRAG:
             return content
         return content[:max_length] + "..."
 
-    async def get_processing_status(self) -> Dict[str, int]:
+    async def get_processing_status(self) -> dict[str, int]:
         """Get current document processing status counts
 
         Returns:
@@ -1177,7 +1195,17 @@ class LightRAG:
         """
         return await self.doc_status.get_status_counts()
 
-    async def adelete_by_doc_id(self, doc_id: str):
+    async def get_docs_by_status(
+        self, status: DocStatus
+    ) -> dict[str, DocProcessingStatus]:
+        """Get documents by status
+
+        Returns:
+            Dict with document id is keys and document status is values
+        """
+        return await self.doc_status.get_docs_by_status(status)
+
+    async def adelete_by_doc_id(self, doc_id: str) -> None:
         """Delete a document and all its related data
 
         Args:
@@ -1185,7 +1213,7 @@ class LightRAG:
         """
         try:
             # 1. Get the document status and related data
-            doc_status = await self.doc_status.get(doc_id)
+            doc_status = await self.doc_status.get_by_id(doc_id)
             if not doc_status:
                 logger.warning(f"Document {doc_id} not found")
                 return
@@ -1193,9 +1221,10 @@ class LightRAG:
             logger.debug(f"Starting deletion for document {doc_id}")
 
             # 2. Get all related chunks
-            chunks = await self.text_chunks.filter(
-                lambda x: x.get("full_doc_id") == doc_id
-            )
+            chunks = await self.text_chunks.get_by_id(doc_id)
+            if not chunks:
+                return
+
             chunk_ids = list(chunks.keys())
             logger.debug(f"Found {len(chunk_ids)} chunks to delete")
 
@@ -1331,9 +1360,7 @@ class LightRAG:
                     logger.error(f"Document {doc_id} still exists in full_docs")
 
                 # Verify if chunks have been deleted
-                remaining_chunks = await self.text_chunks.filter(
-                    lambda x: x.get("full_doc_id") == doc_id
-                )
+                remaining_chunks = await self.text_chunks.get_by_id(doc_id)
                 if remaining_chunks:
                     logger.error(f"Found {len(remaining_chunks)} remaining chunks")
 
@@ -1368,13 +1395,9 @@ class LightRAG:
         except Exception as e:
             logger.error(f"Error while deleting document {doc_id}: {e}")
 
-    def delete_by_doc_id(self, doc_id: str):
-        """Synchronous version of adelete"""
-        return asyncio.run(self.adelete_by_doc_id(doc_id))
-
     async def get_entity_info(
         self, entity_name: str, include_vector_data: bool = False
-    ):
+    ) -> dict[str, str | None | dict[str, str]]:
         """Get detailed information of an entity
 
         Args:
@@ -1394,7 +1417,7 @@ class LightRAG:
         node_data = await self.chunk_entity_relation_graph.get_node(entity_name)
         source_id = node_data.get("source_id") if node_data else None
 
-        result = {
+        result: dict[str, str | None | dict[str, str]] = {
             "entity_name": entity_name,
             "source_id": source_id,
             "graph_data": node_data,
@@ -1408,24 +1431,9 @@ class LightRAG:
 
         return result
 
-    def get_entity_info_sync(self, entity_name: str, include_vector_data: bool = False):
-        """Synchronous version of getting entity information
-
-        Args:
-            entity_name: Entity name (no need for quotes)
-            include_vector_data: Whether to include data from the vector database
-        """
-        try:
-            import tracemalloc
-
-            tracemalloc.start()
-            return asyncio.run(self.get_entity_info(entity_name, include_vector_data))
-        finally:
-            tracemalloc.stop()
-
     async def get_relation_info(
         self, src_entity: str, tgt_entity: str, include_vector_data: bool = False
-    ):
+    ) -> dict[str, str | None | dict[str, str]]:
         """Get detailed information of a relationship
 
         Args:
@@ -1450,7 +1458,7 @@ class LightRAG:
         )
         source_id = edge_data.get("source_id") if edge_data else None
 
-        result = {
+        result: dict[str, str | None | dict[str, str]] = {
             "src_entity": src_entity,
             "tgt_entity": tgt_entity,
             "source_id": source_id,
@@ -1465,22 +1473,20 @@ class LightRAG:
 
         return result
 
-    def get_relation_info_sync(
-        self, src_entity: str, tgt_entity: str, include_vector_data: bool = False
-    ):
-        """Synchronous version of getting relationship information
+    def check_storage_env_vars(self, storage_name: str) -> None:
+        """Check if all required environment variables for storage implementation exist
 
         Args:
-            src_entity: Source entity name (no need for quotes)
-            tgt_entity: Target entity name (no need for quotes)
-            include_vector_data: Whether to include data from the vector database
-        """
-        try:
-            import tracemalloc
+            storage_name: Storage implementation name
 
-            tracemalloc.start()
-            return asyncio.run(
-                self.get_relation_info(src_entity, tgt_entity, include_vector_data)
+        Raises:
+            ValueError: If required environment variables are missing
+        """
+        required_vars = STORAGE_ENV_REQUIREMENTS.get(storage_name, [])
+        missing_vars = [var for var in required_vars if var not in os.environ]
+
+        if missing_vars:
+            raise ValueError(
+                f"Storage implementation '{storage_name}' requires the following "
+                f"environment variables: {', '.join(missing_vars)}"
             )
-        finally:
-            tracemalloc.stop()

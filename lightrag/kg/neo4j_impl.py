@@ -3,7 +3,21 @@ import inspect
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Union, Tuple, List, Dict
+from typing import Any, List, Dict, final
+import numpy as np
+import configparser
+
+
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
+
+from ..utils import logger
+from ..base import BaseGraphStorage
+from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 import pipmaster as pm
 
 if not pm.is_installed("neo4j"):
@@ -16,23 +30,14 @@ from neo4j import (
     AsyncManagedTransaction,
     GraphDatabase,
 )
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
 
-from ..utils import logger
-from ..base import BaseGraphStorage
+config = configparser.ConfigParser()
+config.read("config.ini", "utf-8")
 
 
+@final
 @dataclass
 class Neo4JStorage(BaseGraphStorage):
-    @staticmethod
-    def load_nx_graph(file_name):
-        print("no preloading of graph with neo4j in production")
-
     def __init__(self, namespace, global_config, embedding_func):
         super().__init__(
             namespace=namespace,
@@ -41,15 +46,42 @@ class Neo4JStorage(BaseGraphStorage):
         )
         self._driver = None
         self._driver_lock = asyncio.Lock()
-        URI = os.environ["NEO4J_URI"]
-        USERNAME = os.environ["NEO4J_USERNAME"]
-        PASSWORD = os.environ["NEO4J_PASSWORD"]
-        MAX_CONNECTION_POOL_SIZE = os.environ.get("NEO4J_MAX_CONNECTION_POOL_SIZE", 800)
+
+        URI = os.environ.get("NEO4J_URI", config.get("neo4j", "uri", fallback=None))
+        USERNAME = os.environ.get(
+            "NEO4J_USERNAME", config.get("neo4j", "username", fallback=None)
+        )
+        PASSWORD = os.environ.get(
+            "NEO4J_PASSWORD", config.get("neo4j", "password", fallback=None)
+        )
+        MAX_CONNECTION_POOL_SIZE = int(
+            os.environ.get(
+                "NEO4J_MAX_CONNECTION_POOL_SIZE",
+                config.get("neo4j", "connection_pool_size", fallback=800),
+            )
+        )
+        CONNECTION_TIMEOUT = float(
+            os.environ.get(
+                "NEO4J_CONNECTION_TIMEOUT",
+                config.get("neo4j", "connection_timeout", fallback=60.0),
+            ),
+        )
+        CONNECTION_ACQUISITION_TIMEOUT = float(
+            os.environ.get(
+                "NEO4J_CONNECTION_ACQUISITION_TIMEOUT",
+                config.get("neo4j", "connection_acquisition_timeout", fallback=60.0),
+            ),
+        )
         DATABASE = os.environ.get(
             "NEO4J_DATABASE", re.sub(r"[^a-zA-Z0-9-]", "-", namespace)
         )
+
         self._driver: AsyncDriver = AsyncGraphDatabase.driver(
-            URI, auth=(USERNAME, PASSWORD)
+            URI,
+            auth=(USERNAME, PASSWORD),
+            max_connection_pool_size=MAX_CONNECTION_POOL_SIZE,
+            connection_timeout=CONNECTION_TIMEOUT,
+            connection_acquisition_timeout=CONNECTION_ACQUISITION_TIMEOUT,
         )
 
         # Try to connect to the database
@@ -57,6 +89,8 @@ class Neo4JStorage(BaseGraphStorage):
             URI,
             auth=(USERNAME, PASSWORD),
             max_connection_pool_size=MAX_CONNECTION_POOL_SIZE,
+            connection_timeout=CONNECTION_TIMEOUT,
+            connection_acquisition_timeout=CONNECTION_ACQUISITION_TIMEOUT,
         ) as _sync_driver:
             for database in (DATABASE, None):
                 self._DATABASE = database
@@ -123,12 +157,31 @@ class Neo4JStorage(BaseGraphStorage):
         if self._driver:
             await self._driver.close()
 
-    async def index_done_callback(self):
-        print("KG successfully indexed.")
+    async def index_done_callback(self) -> None:
+        # Noe4J handles persistence automatically
+        pass
+
+    async def _label_exists(self, label: str) -> bool:
+        """Check if a label exists in the Neo4j database."""
+        query = "CALL db.labels() YIELD label RETURN label"
+        try:
+            async with self._driver.session(database=self._DATABASE) as session:
+                result = await session.run(query)
+                labels = [record["label"] for record in await result.data()]
+                return label in labels
+        except Exception as e:
+            logger.error(f"Error checking label existence: {e}")
+            return False
+
+    async def _ensure_label(self, label: str) -> str:
+        """Ensure a label exists by validating it."""
+        clean_label = label.strip('"')
+        if not await self._label_exists(clean_label):
+            logger.warning(f"Label '{clean_label}' does not exist in Neo4j")
+        return clean_label
 
     async def has_node(self, node_id: str) -> bool:
-        entity_name_label = node_id.strip('"')
-
+        entity_name_label = await self._ensure_label(node_id)
         async with self._driver.session(database=self._DATABASE) as session:
             query = (
                 f"MATCH (n:`{entity_name_label}`) RETURN count(n) > 0 AS node_exists"
@@ -156,9 +209,18 @@ class Neo4JStorage(BaseGraphStorage):
             )
             return single_result["edgeExists"]
 
-    async def get_node(self, node_id: str) -> Union[dict, None]:
+    async def get_node(self, node_id: str) -> dict[str, str] | None:
+        """Get node by its label identifier.
+
+        Args:
+            node_id: The node label to look up
+
+        Returns:
+            dict: Node properties if found
+            None: If node not found
+        """
         async with self._driver.session(database=self._DATABASE) as session:
-            entity_name_label = node_id.strip('"')
+            entity_name_label = await self._ensure_label(node_id)
             query = f"MATCH (n:`{entity_name_label}`) RETURN n"
             result = await session.run(query)
             record = await result.single()
@@ -208,41 +270,83 @@ class Neo4JStorage(BaseGraphStorage):
 
     async def get_edge(
         self, source_node_id: str, target_node_id: str
-    ) -> Union[dict, None]:
-        entity_name_label_source = source_node_id.strip('"')
-        entity_name_label_target = target_node_id.strip('"')
-        """
-        Find all edges between nodes of two given labels
+    ) -> dict[str, str] | None:
+        try:
+            entity_name_label_source = source_node_id.strip('"')
+            entity_name_label_target = target_node_id.strip('"')
 
-        Args:
-            source_node_label (str): Label of the source nodes
-            target_node_label (str): Label of the target nodes
-
-        Returns:
-            list: List of all relationships/edges found
-        """
-        async with self._driver.session(database=self._DATABASE) as session:
-            query = f"""
-            MATCH (start:`{entity_name_label_source}`)-[r]->(end:`{entity_name_label_target}`)
-            RETURN properties(r) as edge_properties
-            LIMIT 1
-            """.format(
-                entity_name_label_source=entity_name_label_source,
-                entity_name_label_target=entity_name_label_target,
-            )
-
-            result = await session.run(query)
-            record = await result.single()
-            if record:
-                result = dict(record["edge_properties"])
-                logger.debug(
-                    f"{inspect.currentframe().f_code.co_name}:query:{query}:result:{result}"
+            async with self._driver.session(database=self._DATABASE) as session:
+                query = f"""
+                MATCH (start:`{entity_name_label_source}`)-[r]->(end:`{entity_name_label_target}`)
+                RETURN properties(r) as edge_properties
+                LIMIT 1
+                """.format(
+                    entity_name_label_source=entity_name_label_source,
+                    entity_name_label_target=entity_name_label_target,
                 )
-                return result
-            else:
-                return None
 
-    async def get_node_edges(self, source_node_id: str) -> List[Tuple[str, str]]:
+                result = await session.run(query)
+                record = await result.single()
+                if record:
+                    try:
+                        result = dict(record["edge_properties"])
+                        logger.info(f"Result: {result}")
+                        # Ensure required keys exist with defaults
+                        required_keys = {
+                            "weight": 0.0,
+                            "source_id": None,
+                            "description": None,
+                            "keywords": None,
+                        }
+                        for key, default_value in required_keys.items():
+                            if key not in result:
+                                result[key] = default_value
+                                logger.warning(
+                                    f"Edge between {entity_name_label_source} and {entity_name_label_target} "
+                                    f"missing {key}, using default: {default_value}"
+                                )
+
+                        logger.debug(
+                            f"{inspect.currentframe().f_code.co_name}:query:{query}:result:{result}"
+                        )
+                        return result
+                    except (KeyError, TypeError, ValueError) as e:
+                        logger.error(
+                            f"Error processing edge properties between {entity_name_label_source} "
+                            f"and {entity_name_label_target}: {str(e)}"
+                        )
+                        # Return default edge properties on error
+                        return {
+                            "weight": 0.0,
+                            "description": None,
+                            "keywords": None,
+                            "source_id": None,
+                        }
+
+                logger.debug(
+                    f"{inspect.currentframe().f_code.co_name}: No edge found between {entity_name_label_source} and {entity_name_label_target}"
+                )
+                # Return default edge properties when no edge found
+                return {
+                    "weight": 0.0,
+                    "description": None,
+                    "keywords": None,
+                    "source_id": None,
+                }
+
+        except Exception as e:
+            logger.error(
+                f"Error in get_edge between {source_node_id} and {target_node_id}: {str(e)}"
+            )
+            # Return default edge properties on error
+            return {
+                "weight": 0.0,
+                "description": None,
+                "keywords": None,
+                "source_id": None,
+            }
+
+    async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
         node_label = source_node_id.strip('"')
 
         """
@@ -285,7 +389,7 @@ class Neo4JStorage(BaseGraphStorage):
             )
         ),
     )
-    async def upsert_node(self, node_id: str, node_data: Dict[str, Any]):
+    async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         """
         Upsert a node in the Neo4j database.
 
@@ -293,7 +397,7 @@ class Neo4JStorage(BaseGraphStorage):
             node_id: The unique identifier for the node (used as label)
             node_data: Dictionary of node properties
         """
-        label = node_id.strip('"')
+        label = await self._ensure_label(node_id)
         properties = node_data
 
         async def _do_upsert(tx: AsyncManagedTransaction):
@@ -321,12 +425,13 @@ class Neo4JStorage(BaseGraphStorage):
                 neo4jExceptions.ServiceUnavailable,
                 neo4jExceptions.TransientError,
                 neo4jExceptions.WriteServiceUnavailable,
+                neo4jExceptions.ClientError,
             )
         ),
     )
     async def upsert_edge(
-        self, source_node_id: str, target_node_id: str, edge_data: Dict[str, Any]
-    ):
+        self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
+    ) -> None:
         """
         Upsert an edge and its properties between two nodes identified by their labels.
 
@@ -335,22 +440,23 @@ class Neo4JStorage(BaseGraphStorage):
             target_node_id (str): Label of the target node (used as identifier)
             edge_data (dict): Dictionary of properties to set on the edge
         """
-        source_node_label = source_node_id.strip('"')
-        target_node_label = target_node_id.strip('"')
+        source_label = await self._ensure_label(source_node_id)
+        target_label = await self._ensure_label(target_node_id)
         edge_properties = edge_data
 
         async def _do_upsert_edge(tx: AsyncManagedTransaction):
             query = f"""
-            MATCH (source:`{source_node_label}`)
+            MATCH (source:`{source_label}`)
             WITH source
-            MATCH (target:`{target_node_label}`)
+            MATCH (target:`{target_label}`)
             MERGE (source)-[r:DIRECTED]->(target)
             SET r += $properties
             RETURN r
             """
-            await tx.run(query, properties=edge_properties)
+            result = await tx.run(query, properties=edge_properties)
+            record = await result.single()
             logger.debug(
-                f"Upserted edge from '{source_node_label}' to '{target_node_label}' with properties: {edge_properties}"
+                f"Upserted edge from '{source_label}' to '{target_label}' with properties: {edge_properties}, result: {record['r'] if record else None}"
             )
 
         try:
@@ -365,7 +471,7 @@ class Neo4JStorage(BaseGraphStorage):
 
     async def get_knowledge_graph(
         self, node_label: str, max_depth: int = 5
-    ) -> Dict[str, List[Dict]]:
+    ) -> KnowledgeGraph:
         """
         Get complete connected subgraph for specified node (including the starting node itself)
 
@@ -376,32 +482,41 @@ class Neo4JStorage(BaseGraphStorage):
         4. Add depth control
         """
         label = node_label.strip('"')
-        result = {"nodes": [], "edges": []}
+        result = KnowledgeGraph()
         seen_nodes = set()
         seen_edges = set()
 
         async with self._driver.session(database=self._DATABASE) as session:
             try:
-                # Critical debug step: first verify if starting node exists
-                validate_query = f"MATCH (n:`{label}`) RETURN n LIMIT 1"
-                validate_result = await session.run(validate_query)
-                if not await validate_result.single():
-                    logger.warning(f"Starting node {label} does not exist!")
-                    return result
+                main_query = ""
+                if label == "*":
+                    main_query = """
+                    MATCH (n)
+                    WITH collect(DISTINCT n) AS nodes
+                    MATCH ()-[r]-()
+                    RETURN nodes, collect(DISTINCT r) AS relationships;
+                    """
+                else:
+                    # Critical debug step: first verify if starting node exists
+                    validate_query = f"MATCH (n:`{label}`) RETURN n LIMIT 1"
+                    validate_result = await session.run(validate_query)
+                    if not await validate_result.single():
+                        logger.warning(f"Starting node {label} does not exist!")
+                        return result
 
-                # Optimized query (including direction handling and self-loops)
-                main_query = f"""
-                MATCH (start:`{label}`)
-                WITH start
-                CALL apoc.path.subgraphAll(start, {{
-                    relationshipFilter: '>',
-                    minLevel: 0,
-                    maxLevel: {max_depth},
-                    bfs: true
-                }})
-                YIELD nodes, relationships
-                RETURN nodes, relationships
-                """
+                    # Optimized query (including direction handling and self-loops)
+                    main_query = f"""
+                    MATCH (start:`{label}`)
+                    WITH start
+                    CALL apoc.path.subgraphAll(start, {{
+                        relationshipFilter: '>',
+                        minLevel: 0,
+                        maxLevel: {max_depth},
+                        bfs: true
+                    }})
+                    YIELD nodes, relationships
+                    RETURN nodes, relationships
+                    """
                 result_set = await session.run(main_query)
                 record = await result_set.single()
 
@@ -409,35 +524,36 @@ class Neo4JStorage(BaseGraphStorage):
                     # Handle nodes (compatible with multi-label cases)
                     for node in record["nodes"]:
                         # Use node ID + label combination as unique identifier
-                        node_id = f"{node.id}_{'_'.join(node.labels)}"
+                        node_id = node.id
                         if node_id not in seen_nodes:
-                            node_data = dict(node)
-                            node_data["labels"] = list(node.labels)  # Keep all labels
-                            result["nodes"].append(node_data)
+                            result.nodes.append(
+                                KnowledgeGraphNode(
+                                    id=f"{node_id}",
+                                    labels=list(node.labels),
+                                    properties=dict(node),
+                                )
+                            )
                             seen_nodes.add(node_id)
 
                     # Handle relationships (including direction information)
                     for rel in record["relationships"]:
-                        edge_id = f"{rel.id}_{rel.type}"
+                        edge_id = rel.id
                         if edge_id not in seen_edges:
                             start = rel.start_node
                             end = rel.end_node
-                            edge_data = dict(rel)
-                            edge_data.update(
-                                {
-                                    "source": f"{start.id}_{'_'.join(start.labels)}",
-                                    "target": f"{end.id}_{'_'.join(end.labels)}",
-                                    "type": rel.type,
-                                    "direction": rel.element_id.split(
-                                        "->" if rel.end_node == end else "<-"
-                                    )[1],
-                                }
+                            result.edges.append(
+                                KnowledgeGraphEdge(
+                                    id=f"{edge_id}",
+                                    type=rel.type,
+                                    source=f"{start.id}",
+                                    target=f"{end.id}",
+                                    properties=dict(rel),
+                                )
                             )
-                            result["edges"].append(edge_data)
                             seen_edges.add(edge_id)
 
                     logger.info(
-                        f"Subgraph query successful | Node count: {len(result['nodes'])} | Edge count: {len(result['edges'])}"
+                        f"Subgraph query successful | Node count: {len(result.nodes)} | Edge count: {len(result.edges)}"
                     )
 
             except neo4jExceptions.ClientError as e:
@@ -512,7 +628,7 @@ class Neo4JStorage(BaseGraphStorage):
         await traverse(label, 0)
         return result
 
-    async def get_all_labels(self) -> List[str]:
+    async def get_all_labels(self) -> list[str]:
         """
         Get all existing node labels in the database
         Returns:
@@ -536,3 +652,11 @@ class Neo4JStorage(BaseGraphStorage):
             async for record in result:
                 labels.append(record["label"])
             return labels
+
+    async def delete_node(self, node_id: str) -> None:
+        raise NotImplementedError
+
+    async def embed_nodes(
+        self, algorithm: str
+    ) -> tuple[np.ndarray[Any, Any], list[str]]:
+        raise NotImplementedError

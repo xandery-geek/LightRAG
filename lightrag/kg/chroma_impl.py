@@ -1,27 +1,33 @@
-import os
 import asyncio
 from dataclasses import dataclass
-from typing import Union
+from typing import Any, final
 import numpy as np
-from chromadb import HttpClient
-from chromadb.config import Settings
+
 from lightrag.base import BaseVectorStorage
 from lightrag.utils import logger
+import pipmaster as pm
+
+if not pm.is_installed("chromadb"):
+    pm.install("chromadb")
+
+from chromadb import HttpClient, PersistentClient
+from chromadb.config import Settings
 
 
+@final
 @dataclass
 class ChromaVectorDBStorage(BaseVectorStorage):
     """ChromaDB vector storage implementation."""
 
-    cosine_better_than_threshold: float = float(os.getenv("COSINE_THRESHOLD", "0.2"))
-
     def __post_init__(self):
         try:
-            # Use global config value if specified, otherwise use default
             config = self.global_config.get("vector_db_storage_cls_kwargs", {})
-            self.cosine_better_than_threshold = config.get(
-                "cosine_better_than_threshold", self.cosine_better_than_threshold
-            )
+            cosine_threshold = config.get("cosine_better_than_threshold")
+            if cosine_threshold is None:
+                raise ValueError(
+                    "cosine_better_than_threshold must be specified in vector_db_storage_cls_kwargs"
+                )
+            self.cosine_better_than_threshold = cosine_threshold
 
             user_collection_settings = config.get("collection_settings", {})
             # Default HNSW index settings for ChromaDB
@@ -48,31 +54,43 @@ class ChromaVectorDBStorage(BaseVectorStorage):
                 **user_collection_settings,
             }
 
-            auth_provider = config.get(
-                "auth_provider", "chromadb.auth.token_authn.TokenAuthClientProvider"
-            )
-            auth_credentials = config.get("auth_token", "secret-token")
-            headers = {}
+            local_path = config.get("local_path", None)
+            if local_path:
+                self._client = PersistentClient(
+                    path=local_path,
+                    settings=Settings(
+                        allow_reset=True,
+                        anonymized_telemetry=False,
+                    ),
+                )
+            else:
+                auth_provider = config.get(
+                    "auth_provider", "chromadb.auth.token_authn.TokenAuthClientProvider"
+                )
+                auth_credentials = config.get("auth_token", "secret-token")
+                headers = {}
 
-            if "token_authn" in auth_provider:
-                headers = {
-                    config.get("auth_header_name", "X-Chroma-Token"): auth_credentials
-                }
-            elif "basic_authn" in auth_provider:
-                auth_credentials = config.get("auth_credentials", "admin:admin")
+                if "token_authn" in auth_provider:
+                    headers = {
+                        config.get(
+                            "auth_header_name", "X-Chroma-Token"
+                        ): auth_credentials
+                    }
+                elif "basic_authn" in auth_provider:
+                    auth_credentials = config.get("auth_credentials", "admin:admin")
 
-            self._client = HttpClient(
-                host=config.get("host", "localhost"),
-                port=config.get("port", 8000),
-                headers=headers,
-                settings=Settings(
-                    chroma_api_impl="rest",
-                    chroma_client_auth_provider=auth_provider,
-                    chroma_client_auth_credentials=auth_credentials,
-                    allow_reset=True,
-                    anonymized_telemetry=False,
-                ),
-            )
+                self._client = HttpClient(
+                    host=config.get("host", "localhost"),
+                    port=config.get("port", 8000),
+                    headers=headers,
+                    settings=Settings(
+                        chroma_api_impl="rest",
+                        chroma_client_auth_provider=auth_provider,
+                        chroma_client_auth_credentials=auth_credentials,
+                        allow_reset=True,
+                        anonymized_telemetry=False,
+                    ),
+                )
 
             self._collection = self._client.get_or_create_collection(
                 name=self.namespace,
@@ -89,10 +107,10 @@ class ChromaVectorDBStorage(BaseVectorStorage):
             logger.error(f"ChromaDB initialization failed: {str(e)}")
             raise
 
-    async def upsert(self, data: dict[str, dict]):
+    async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        logger.info(f"Inserting {len(data)} to {self.namespace}")
         if not data:
-            logger.warning("Empty data provided to vector DB")
-            return []
+            return
 
         try:
             ids = list(data.keys())
@@ -138,12 +156,14 @@ class ChromaVectorDBStorage(BaseVectorStorage):
             logger.error(f"Error during ChromaDB upsert: {str(e)}")
             raise
 
-    async def query(self, query: str, top_k=5) -> Union[dict, list[dict]]:
+    async def query(self, query: str, top_k: int) -> list[dict[str, Any]]:
         try:
             embedding = await self.embedding_func([query])
 
             results = self._collection.query(
-                query_embeddings=embedding.tolist(),
+                query_embeddings=embedding.tolist()
+                if not isinstance(embedding, list)
+                else embedding,
                 n_results=top_k * 2,  # Request more results to allow for filtering
                 include=["metadatas", "distances", "documents"],
             )
@@ -168,6 +188,12 @@ class ChromaVectorDBStorage(BaseVectorStorage):
             logger.error(f"Error during ChromaDB query: {str(e)}")
             raise
 
-    async def index_done_callback(self):
+    async def index_done_callback(self) -> None:
         # ChromaDB handles persistence automatically
         pass
+
+    async def delete_entity(self, entity_name: str) -> None:
+        raise NotImplementedError
+
+    async def delete_entity_relation(self, entity_name: str) -> None:
+        raise NotImplementedError
