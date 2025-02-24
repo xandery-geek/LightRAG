@@ -412,6 +412,139 @@ class LightRAG:
             loop = always_get_an_event_loop()
             loop.run_until_complete(self.finalize_storages())
 
+    def reinit_storages(self, working_dir, log_file_path, llm_model_func=None):
+        import logging
+
+        # Finalize storages before reinitializing
+        if self.auto_manage_storages_states:
+            loop = always_get_an_event_loop()
+            loop.run_until_complete(self.finalize_storages())
+
+        self.working_dir = working_dir
+        self.log_file_path = log_file_path
+        os.makedirs(os.path.dirname(self.log_file_path), exist_ok=True)
+        
+        # Reinitialize logger
+        logger = logging.getLogger("lightrag")
+        logger.removeHandler(logger.handlers[0])
+        set_logger(self.log_file_path)
+
+        logger.info(f"Logger initialized for working directory: {self.working_dir}")
+
+        if not os.path.exists(self.working_dir):
+            logger.info(f"Creating working directory {self.working_dir}")
+            os.makedirs(self.working_dir)
+
+        # Get global config
+        global_config = self.llm_response_cache.global_config
+        global_config["working_dir"] = self.working_dir
+        global_config["log_file_path"] = self.log_file_path
+
+        # Reinitialize all storages
+        self.key_string_value_json_storage_cls: type[BaseKVStorage] = (
+            self._get_storage_class(self.kv_storage)
+        )  # type: ignore
+        self.vector_db_storage_cls: type[BaseVectorStorage] = self._get_storage_class(
+            self.vector_storage
+        )  # type: ignore
+        self.graph_storage_cls: type[BaseGraphStorage] = self._get_storage_class(
+            self.graph_storage
+        )  # type: ignore
+        self.key_string_value_json_storage_cls = partial(  # type: ignore
+            self.key_string_value_json_storage_cls, global_config=global_config
+        )
+        self.vector_db_storage_cls = partial(  # type: ignore
+            self.vector_db_storage_cls, global_config=global_config
+        )
+        self.graph_storage_cls = partial(  # type: ignore
+            self.graph_storage_cls, global_config=global_config
+        )
+
+        # Reinitialize document status storage
+        self.doc_status_storage_cls = self._get_storage_class(self.doc_status_storage)
+
+        self.llm_response_cache: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
+            namespace=make_namespace(
+                self.namespace_prefix, NameSpace.KV_STORE_LLM_RESPONSE_CACHE
+            ),
+            embedding_func=self.embedding_func,
+        )
+
+        self.full_docs: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
+            namespace=make_namespace(
+                self.namespace_prefix, NameSpace.KV_STORE_FULL_DOCS
+            ),
+            embedding_func=self.embedding_func,
+        )
+        self.text_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
+            namespace=make_namespace(
+                self.namespace_prefix, NameSpace.KV_STORE_TEXT_CHUNKS
+            ),
+            embedding_func=self.embedding_func,
+        )
+        self.chunk_entity_relation_graph: BaseGraphStorage = self.graph_storage_cls(  # type: ignore
+            namespace=make_namespace(
+                self.namespace_prefix, NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION
+            ),
+            embedding_func=self.embedding_func,
+        )
+
+        self.entities_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
+            namespace=make_namespace(
+                self.namespace_prefix, NameSpace.VECTOR_STORE_ENTITIES
+            ),
+            embedding_func=self.embedding_func,
+            meta_fields={"entity_name"},
+        )
+        self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
+            namespace=make_namespace(
+                self.namespace_prefix, NameSpace.VECTOR_STORE_RELATIONSHIPS
+            ),
+            embedding_func=self.embedding_func,
+            meta_fields={"src_id", "tgt_id"},
+        )
+        self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
+            namespace=make_namespace(
+                self.namespace_prefix, NameSpace.VECTOR_STORE_CHUNKS
+            ),
+            embedding_func=self.embedding_func,
+        )
+
+        # Initialize document status storage
+        self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
+            namespace=make_namespace(self.namespace_prefix, NameSpace.DOC_STATUS),
+            global_config=global_config,
+            embedding_func=None,
+        )
+
+        if self.llm_response_cache and hasattr(
+            self.llm_response_cache, "global_config"
+        ):
+            hashing_kv = self.llm_response_cache
+        else:
+            hashing_kv = self.key_string_value_json_storage_cls(  # type: ignore
+                namespace=make_namespace(
+                    self.namespace_prefix, NameSpace.KV_STORE_LLM_RESPONSE_CACHE
+                ),
+                embedding_func=self.embedding_func,
+            )
+
+        self.llm_model_func = limit_async_func_call(self.llm_model_max_async)(
+            partial(
+                llm_model_func,  # type: ignore
+                hashing_kv=hashing_kv,
+                **self.llm_model_kwargs,
+            )
+        )
+
+        self._storages_status = StoragesStatus.CREATED
+
+        # Initialize storages
+        if self.auto_manage_storages_states:
+            loop = always_get_an_event_loop()
+            loop.run_until_complete(self.initialize_storages())
+
+
     async def initialize_storages(self):
         """Asynchronously initialize the storages"""
         if self._storages_status == StoragesStatus.CREATED:
